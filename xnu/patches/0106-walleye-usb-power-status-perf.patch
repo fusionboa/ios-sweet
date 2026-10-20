@@ -1,0 +1,737 @@
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index 327527a..cebb418 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -18,6 +18,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma);
++int sweet_rpm_clk_enable(const char *type, unsigned id);
+ 
+ #define RPM_RAM_PA              0x00778000u
+ #define RPM_RAM_SIZE            0x7000u
+@@ -478,9 +479,9 @@ rpm_request(uint32_t set, uint32_t type, uint32_t id, const uint32_t *kvp, uint3
+ 	return ETIMEDOUT;
+ }
+ 
+-/* Enable an RPM regulator ("ldoa", 28, 3300000 uV, 100 mA) in both sets. */
+-int
+-sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma)
++/* Send the key/value pairs for type/id in the active and the sleep set. */
++static int
++rpm_enable(const char *type, unsigned id, const uint32_t *kvp, uint32_t nkvp)
+ {
+ 	static bool tried;
+ 	if (!tried) {
+@@ -492,11 +493,6 @@ sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma)
+ 	}
+ 	uint32_t type_word = (uint32_t)(uint8_t)type[0] | (uint32_t)(uint8_t)type[1] << 8 |
+ 	    (uint32_t)(uint8_t)type[2] << 16 | (uint32_t)(uint8_t)type[3] << 24;
+-	uint32_t kvp[9] = {
+-		RPM_KEY_SWEN, 4, 1,
+-		RPM_KEY_UV, 4, uv,
+-		RPM_KEY_MA, 4, ma,
+-	};
+ 	int error = 0;
+ 	IOLockLock(rpm.lock);
+ 	if (rpm.broken) {
+@@ -505,14 +501,37 @@ sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma)
+ 		error = rpm_link_up();
+ 	}
+ 	if (!error) {
+-		error = rpm_request(RPM_SET_ACTIVE, type_word, id, kvp, ma ? 3 : 2);
++		error = rpm_request(RPM_SET_ACTIVE, type_word, id, kvp, nkvp);
+ 	}
+ 	if (!error) {
+-		error = rpm_request(RPM_SET_SLEEP, type_word, id, kvp, ma ? 3 : 2);
++		error = rpm_request(RPM_SET_SLEEP, type_word, id, kvp, nkvp);
+ 	}
+ 	IOLockUnlock(rpm.lock);
++	return error;
++}
++
++/* Enable an RPM regulator ("ldoa", 28, 3300000 uV, 100 mA) in both sets. */
++int
++sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma)
++{
++	uint32_t kvp[9] = {
++		RPM_KEY_SWEN, 4, 1,
++		RPM_KEY_UV, 4, uv,
++		RPM_KEY_MA, 4, ma,
++	};
++	int error = rpm_enable(type, id, kvp, ma ? 3 : 2);
+ 	printf("SWEET RPM: %s%u on at %u uV, %u mA: %s (%d)\n", type, id, uv, ma,
+ 	    error ? "FAILED" : "ok", error);
+ 	return error;
+ }
++
++/* Enable an RPM clock buffer ("clka", 1 = LN_BB_CLK1) in both sets. */
++int
++sweet_rpm_clk_enable(const char *type, unsigned id)
++{
++	uint32_t kvp[3] = {RPM_KEY_SWEN, 4, 1};
++	int error = rpm_enable(type, id, kvp, 1);
++	printf("SWEET RPM: clock %s%u on: %s (%d)\n", type, id, error ? "FAILED" : "ok", error);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index d7887dd..99e6e55 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -31,6 +31,7 @@ extern void _disable_preemption(void);
+ extern void _enable_preemption(void);
+ extern int sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_status_set(unsigned slot, const char *text);
+ void sweet_touch_init(void);
+ 
+ #define TS_GCC_PA        0x00100000u
+@@ -774,9 +775,11 @@ touch_thread(void *arg, wait_result_t result)
+ 	int err = touch_bring_up();
+ 	if (err) {
+ 		printf("SWEET TOUCH: bring-up failed (%d); stopping\n", err);
++		sweet_status_set(6, "T err");
+ 		goto out;
+ 	}
+ 	printf("SWEET TOUCH: Synaptics RMI4 ready, %u objects, flip %d\n", st.fingers, st.flip);
++	sweet_status_set(6, "T ok");
+ 	unsigned errors = 0, idle = 0, resets = 0;
+ 	bool told = false;
+ 	while (!st.dead) {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 3a0aa3d..85498db 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -39,6 +39,10 @@
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma);
++extern int sweet_rpm_clk_enable(const char *type, unsigned id);
++extern void sweet_status_set(unsigned slot, const char *text);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -66,6 +70,34 @@ static const struct {
+ #define QUSB2_PA                0x0c012000
+ #define QUSB2_SIZE              0x00000400
+ 
++/*
++ * walleye: ABL powers USB down before it starts the kernel (unlike sweet's).
++ * Bring it back as Linux does (gdsc.c, gcc-msm8998.c, phy-msm-qusb-v2.c,
++ * dwc3-qcom.c), using the live DT: the QUSB2 rails L1 0.88 V, L2 1.2 V,
++ * L12 1.8 V, L24 3.088 V and its LN_BB_CLK1 reference over RPM, the USB30
++ * GDSC, the GCC clocks (master 120 MHz), the TCSR 1.8 V clamp, the PHY
++ * (BCR reset, DT qcom,qusb-phy-init-seq, PLL lock), then the DWC3 in device
++ * mode at high speed with the UTMI clock as its PIPE clock.
++ */
++#define GCC_USB30_MASTER_RCG    0x0f014         /* CMD; CFG at +4 */
++#define GCC_QUSB2PHY_PRIM_BCR   0x12000
++#define TCSR_PA                 0x01fcb000      /* tcsr_clamp_dig_n_1p8 at +0x24c */
++#define QUSB2_PLL_STATUS        0x1a0           /* PLL_COMMON_STATUS_ONE, bit 0 core ready */
++#define QUSB2_PWR_CTRL1         0x210           /* bit 0 power down */
++#define QSCRATCH_GENERAL_CFG    0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
++#define QSCRATCH_PA_WALLEYE     0x0a8f8800      /* = QSCRATCH_PA below */
++#define DWC3_GCTL               0xc110
++#define DWC3_GUSB2PHYCFG        0xc200
++#define   GUSB2PHYCFG_SUSPHY    (1u << 6)
++
++static const uint16_t qusb2_init_seq[][2] = {   /* value, register */
++	{0x13, 0x004}, {0x7c, 0x18c}, {0x80, 0x02c}, {0x0a, 0x184},
++	{0xf5, 0x23c}, {0x0b, 0x240}, {0xe4, 0x248}, {0x19, 0x0b4},
++};
++
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -74,22 +106,128 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
+-void
+-sweet_usb_probe(void)
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
+ {
+-	int enabled = 1;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* walleye power-up (see above). True when the GDSC was off: DWC3 at reset values. */
++static bool
++usb_power_up(vm_offset_t gcc)
++{
++	sweet_status_set(5, "U1");
++	int votes = sweet_rpm_vreg_enable("ldoa", 1, 880000, 20) |
++	    sweet_rpm_vreg_enable("ldoa", 2, 1200000, 20) |
++	    sweet_rpm_vreg_enable("ldoa", 12, 1800000, 30) |
++	    sweet_rpm_vreg_enable("ldoa", 24, 3088000, 30) |
++	    sweet_rpm_clk_enable("clka", 1);
++	if (votes) {
++		printf("SWEET USB: some RPM votes failed; continuing\n");
++	}
++	bool fresh = false;
++	uint32_t g = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	if (!(g & (1u << 31))) {
++		fresh = true;
++		g &= ~7u;                       /* SW_COLLAPSE, HW_CONTROL, SW_OVERRIDE off */
++		if (!(g & (0xfu << 20))) {
++			g |= (2u << 20) | (8u << 16) | (2u << 12);      /* EN_REST/EN_FEW/CLK_DIS waits */
++		}
++		usb_wr(gcc, GCC_USB30_PRIM_GDSCR, g);
++		for (int i = 0; i < 200 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)); i++) {
++			delay(10);
++		}
++		printf("SWEET USB: GDSC switched on: 0x%08x\n", usb_rd(gcc, GCC_USB30_PRIM_GDSCR));
++	}
++	sweet_status_set(5, (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)) ? "U2" : "U2x");
++	/* Master (AXI) clock 120 MHz: GPLL0 (source 1) / 5, if it is still on XO */
++	uint32_t cfg = usb_rd(gcc, GCC_USB30_MASTER_RCG + 4);
++	if (((cfg >> 8) & 7u) == 0) {
++		usb_wr(gcc, GCC_USB30_MASTER_RCG + 4, (cfg & ~0x371fu) | (1u << 8) | 9u);
++		usb_wr(gcc, GCC_USB30_MASTER_RCG, usb_rd(gcc, GCC_USB30_MASTER_RCG) | 1u);
++		for (int i = 0; i < 500 && (usb_rd(gcc, GCC_USB30_MASTER_RCG) & 1u); i++) {
++			delay(1);
++		}
++	}
++	printf("SWEET USB: master RCG cfg 0x%08x -> 0x%08x\n", cfg, usb_rd(gcc, GCC_USB30_MASTER_RCG + 4));
++	bool clocks = true;
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		uint32_t v = usb_rd(gcc, usb_cbcr[i].off);
++		if (v & CBCR_CLK_OFF) {
++			usb_wr(gcc, usb_cbcr[i].off, v | 1u);
++			for (int t = 0; t < 500 && (usb_rd(gcc, usb_cbcr[i].off) & CBCR_CLK_OFF); t++) {
++				delay(1);
++			}
++			v = usb_rd(gcc, usb_cbcr[i].off);
++			printf("SWEET USB: clk %s enabled: 0x%08x\n", usb_cbcr[i].name, v);
++		}
++		clocks &= !(v & CBCR_CLK_OFF);
++	}
++	sweet_status_set(5, clocks ? "U3" : "U3x");
++	vm_offset_t tcsr = ml_io_map(TCSR_PA, 0x1000);
++	if (tcsr != 0) {
++		usb_wr(tcsr, 0x24c, 1);         /* release the PHY's 1.8 V digital clamp */
++	}
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (phy == 0) {
++		return fresh;
++	}
++	uint32_t pll = usb_rd(phy, QUSB2_PLL_STATUS);
++	if (!(pll & 1u)) {
++		usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 1);
++		delay(150);
++		usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 0);
++		delay(150);
++		usb_wr(phy, QUSB2_PWR_CTRL1, usb_rd(phy, QUSB2_PWR_CTRL1) | 1u);
++		for (unsigned i = 0; i < sizeof(qusb2_init_seq) / sizeof(qusb2_init_seq[0]); i++) {
++			usb_wr(phy, qusb2_init_seq[i][1], qusb2_init_seq[i][0]);
++		}
++		usb_wr(phy, QUSB2_PWR_CTRL1, usb_rd(phy, QUSB2_PWR_CTRL1) & ~1u);
++		for (int i = 0; i < 50 && !(usb_rd(phy, QUSB2_PLL_STATUS) & 1u); i++) {
++			delay(20);
++		}
++		printf("SWEET USB: QUSB2 initialized, PLL status 0x%02x -> 0x%02x\n", pll,
++		    usb_rd(phy, QUSB2_PLL_STATUS));
++	}
++	sweet_status_set(5, (usb_rd(phy, QUSB2_PLL_STATUS) & 1u) ? "U4" : "U4x");
++	if (fresh) {
++		vm_offset_t qs = ml_io_map(QSCRATCH_PA_WALLEYE, 0x100);
++		vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++		if (qs != 0 && dwc != 0) {
++			/* High speed only: PIPE clock from UTMI (Linux dwc3_qcom_select_utmi_clk). */
++			usb_wr(qs, QSCRATCH_GENERAL_CFG, usb_rd(qs, QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_DIS);
++			delay(100);
++			usb_wr(qs, QSCRATCH_GENERAL_CFG, usb_rd(qs, QSCRATCH_GENERAL_CFG) |
++			    PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++			delay(100);
++			usb_wr(qs, QSCRATCH_GENERAL_CFG, usb_rd(qs, QSCRATCH_GENERAL_CFG) & ~PIPE_UTMI_CLK_DIS);
++			/* Device mode (GCTL.PrtCapDir = 2); the HS PHY never suspended. */
++			usb_wr(dwc, DWC3_GCTL, (usb_rd(dwc, DWC3_GCTL) & ~(3u << 12)) | (2u << 12));
++			usb_wr(dwc, DWC3_GUSB2PHYCFG, usb_rd(dwc, DWC3_GUSB2PHYCFG) & ~GUSB2PHYCFG_SUSPHY);
++			printf("SWEET USB: DWC3 set up for device mode: GCTL 0x%08x GUSB2PHYCFG 0x%08x\n",
++			    usb_rd(dwc, DWC3_GCTL), usb_rd(dwc, DWC3_GUSB2PHYCFG));
++		}
++	}
++	return fresh;
++}
++
++static void
++sweet_usb_probe_thread(void *arg, wait_result_t result)
++{
++	int enabled = (int)(uintptr_t)arg;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
++	(void)result;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+-	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+-	if (!enabled) {
+-		return;
+-	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+-		return;
++		goto out;
++	}
++	if (enabled >= 2) {
++		(void)usb_power_up(gcc);
+ 	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+@@ -102,12 +240,12 @@ sweet_usb_probe(void)
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+-		return;
++		goto out;
+ 	}
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+ 	if (dwc == 0) {
+ 		printf("SWEET USB: DWC3 map failed\n");
+-		return;
++		goto out;
+ 	}
+ 	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+ 	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+@@ -122,17 +260,37 @@ sweet_usb_probe(void)
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
++		goto out;
+ 	}
+ 	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+ 	if (phy == 0) {
+-		return;
++		goto out;
+ 	}
+ 	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+ 	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+ 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+ 	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_usb_probe(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	/* The RPM votes and PHY bring-up wait: keep them off the root mount path. */
++	if (kernel_thread_start(sweet_usb_probe_thread, (void *)(uintptr_t)enabled, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ /*
+@@ -413,6 +571,7 @@ ud_configure(void)
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
++	sweet_status_set(5, "U OK");
+ 	ud_rx_arm();
+ 	printf("SWEET USB: ECM endpoints configured\n");
+ }
+@@ -876,6 +1035,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+ 	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		sweet_status_set(5, "U5x");
+ 		return;
+ 	}
+ 
+@@ -920,6 +1080,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		delay(1000);
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	sweet_status_set(5, "U6");
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 8214579..ddf02f2 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,8 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++/* SweetFramebuffer.cpp status readout */
++extern "C" void sweet_status_set(unsigned slot, const char *text);
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -155,6 +157,9 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		legacy->release();
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
++	char text[8];
++	snprintf(text, sizeof(text), "B %u%%", percent);
++	sweet_status_set(7, text);
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV %dmA external=%d charging=%d\n",
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 470ca19..3bfaa73 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -23,6 +23,35 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void sweet_status_set(unsigned slot, const char *text);  /* SweetFramebuffer.cpp */
++
++/* Clock of each CPU in MHz, measured in initCPU (cycle counter vs system counter). */
++static uint32_t sweet_cpu_mhz[SWEET_SMP_MAX_CPUS];
++
++static uint32_t
++sweet_cpu_measure_mhz(void)
++{
++	uint64_t pmcr = __builtin_arm_rsr64("PMCR_EL0");
++	uint64_t counters = __builtin_arm_rsr64("PMCNTENSET_EL0");
++	/* E: enable; D (bit 3) clear: count every cycle */
++	__builtin_arm_wsr64("PMCR_EL0", (pmcr | 1ULL) & ~(1ULL << 3));
++	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ULL << 31);
++	__builtin_arm_isb(ISB_SY);
++	uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	uint64_t t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++	uint64_t c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	uint64_t t1;
++	do {
++		t1 = __builtin_arm_rsr64("CNTVCT_EL0");
++	} while (t1 - t0 < freq / 200);         /* 5 ms */
++	uint64_t c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	if (!(counters & (1ULL << 31))) {
++		__builtin_arm_wsr64("PMCNTENCLR_EL0", 1ULL << 31);
++	}
++	__builtin_arm_wsr64("PMCR_EL0", pmcr);
++	__builtin_arm_isb(ISB_SY);
++	return (uint32_t)((c1 - c0) * freq / (t1 - t0) / 1000000);
++}
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -220,8 +249,14 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+-	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+-	    alive, topology->num_cpus);
++	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified; MHz %u %u %u %u\n",
++	    alive, topology->num_cpus, sweet_cpu_mhz[0], sweet_cpu_mhz[1], sweet_cpu_mhz[2],
++	    sweet_cpu_mhz[3]);
++	char text[8];
++	snprintf(text, sizeof(text), "CPU %u", alive);
++	sweet_status_set(0, text);
++	snprintf(text, sizeof(text), "%uM", sweet_cpu_mhz[0]);
++	sweet_status_set(1, text);
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -241,6 +276,9 @@ SweetCPU::initCPU(bool boot)
+ 	assert(cpu_number() == (int)getCPUNumber());
+ 
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
++	if (getCPUNumber() < SWEET_SMP_MAX_CPUS) {
++		sweet_cpu_mhz[getCPUNumber()] = sweet_cpu_measure_mhz();
++	}
+ 
+ 	/* Secondary startup runs at splsched: queue the self-IPI and return.
+ 	 * startAll waits for its delivery after the startup thread unmasks IRQs.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 54b7c1d..9336d14 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,27 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c, 8x16 */
++
++/*
++ * walleye status readout: up to SWEET_STATUS_SLOTS short lines (6 visible
++ * characters each) drawn in the left letterbox bar, outside the iOS image.
++ * Drivers set them with sweet_status_set(); boot-arg sweetstatus=0 hides it.
++ */
++#define SWEET_STATUS_SLOTS      8
++static char gSweetStatus[SWEET_STATUS_SLOTS][8];
++static uint32_t gSweetStatusGen;
++
++extern "C" void sweet_status_set(unsigned slot, const char *text);
++
++extern "C" void
++sweet_status_set(unsigned slot, const char *text)
++{
++	if (slot < SWEET_STATUS_SLOTS && text != NULL) {
++		strlcpy(gSweetStatus[slot], text, sizeof(gSweetStatus[slot]));
++		__atomic_add_fetch(&gSweetStatusGen, 1, __ATOMIC_RELEASE);
++	}
++}
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -81,6 +102,7 @@ enum {
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++#define SWEET_FB_HASH_ROWS              2560
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -116,6 +138,22 @@ public:
+ 	int32_t       fOutX, fOutY;
+ 	uint32_t      fOutW, fOutH;
+ 	uint32_t      fColX[1088];              /* per panel column: source x << 8 | weight */
++	/*
++	 * Rows of a single scaled layer whose pixels did not change since the
++	 * last copy (64-bit hash per source row) are not filtered again.
++	 */
++	bool          fFullRedraw;
++	struct {
++		uint32_t width, height, bpr;
++		int32_t sx, sy, dx, dy, w, h;
++	} fLastGeom;
++	uint64_t      fRowHash[SWEET_FB_HASH_ROWS];
++	uint8_t       fSrcDirty[SWEET_FB_HASH_ROWS];
++	/* status readout: counts over the last second */
++	uint32_t      fPresents, fSwapsSeen, fStatusDrawnGen;
++	uint64_t      fCopyAbs;
++	bool          fStatusOn;
++	void drawStatus(void);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -234,6 +272,10 @@ AppleCLCD::start(IOService *provider)
+ 		fOutY = (int32_t)(fHeight - fOutH) / 2;
+ 		fScaled = true;
+ 	}
++	fFullRedraw = true;
++	int status = 1;
++	PE_parse_boot_argn("sweetstatus", &status, sizeof(status));
++	fStatusOn = status != 0;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -314,6 +356,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	uint32_t swaps = 0;
++	if ((count % 60) == 0) {
++		swaps = fb->fSwapsSeen;
++		fb->fSwapsSeen = 0;
++	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -327,9 +374,63 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	if ((count % 60) == 0) {
++		char text[8];
++		uint64_t ns;
++		absolutetime_to_nanoseconds(fb->fCopyAbs, &ns);
++		snprintf(text, sizeof(text), "F %u", fb->fPresents);
++		sweet_status_set(2, text);
++		snprintf(text, sizeof(text), "S %u", swaps);
++		sweet_status_set(3, text);
++		snprintf(text, sizeof(text), "C %llu", ns / 1000000);
++		sweet_status_set(4, text);
++		fb->fPresents = 0;
++	}
++	if (fb->fStatusOn && __atomic_load_n(&gSweetStatusGen, __ATOMIC_ACQUIRE) != fb->fStatusDrawnGen) {
++		fb->drawStatus();
++	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
++/* The status lines, 2x scaled 8x16 font, grey on black, in the left bar. */
++void
++AppleCLCD::drawStatus(void)
++{
++	fStatusDrawnGen = __atomic_load_n(&gSweetStatusGen, __ATOMIC_ACQUIRE);
++	const uint32_t scale = 2, cw = 8 * scale, chh = 16 * scale, gap = 8;
++	if (!fScaled || fPowerOff || fOutX < (int32_t)cw * 2) {
++		return;
++	}
++	uint32_t chars = (uint32_t)fOutX / cw;
++	if (chars > 6) {
++		chars = 6;
++	}
++	for (uint32_t slot = 0; slot < SWEET_STATUS_SLOTS; slot++) {
++		char text[8];
++		memcpy(text, gSweetStatus[slot], sizeof(text));
++		text[7] = 0;
++		uint32_t y0 = 80 + slot * (chh + gap);
++		if (y0 + chh > fHeight) {
++			break;
++		}
++		bool ended = false;
++		for (uint32_t i = 0; i < chars; i++) {
++			unsigned char c = ended ? ' ' : (unsigned char)text[i];
++			if (c == 0) {
++				ended = true;
++				c = ' ';
++			}
++			for (uint32_t row = 0; row < chh; row++) {
++				unsigned char bits = iso_font[c * 16u + row / scale];
++				uint32_t *out = (uint32_t *)(fPixels + (uint64_t)(y0 + row) * fRowBytes) + i * cw;
++				for (uint32_t bx = 0; bx < cw; bx++) {
++					out[bx] = ((bits >> (bx / scale)) & 1u) ? 0xffa8a8a8u : 0xff000000u;
++				}
++			}
++		}
++	}
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -367,6 +468,23 @@ static uint64_t sweet_fb_swap_count;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/* 64-bit hash of one row of w 32-bit pixels at address p */
++static uint64_t
++sweet_row_hash(uintptr_t p, int32_t w)
++{
++	uint64_t h = 0xcbf29ce484222325ULL;
++	int32_t i = 0;
++	if ((p & 7) == 0) {
++		for (; i + 1 < w; i += 2) {
++			h = (h ^ *(const uint64_t *)(p + (uintptr_t)i * 4)) * 0x100000001b3ULL;
++		}
++	}
++	for (; i < w; i++) {
++		h = (h ^ *(const uint32_t *)(p + (uintptr_t)i * 4)) * 0x100000001b3ULL;
++	}
++	return h;
++}
++
+ /* a + (b - a) * w / 256 on all four 8-bit channels of a8r8g8b8 */
+ static inline uint32_t
+ sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
+@@ -382,7 +500,8 @@ sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
+  */
+ static void
+ sweet_fb_scaled_copy(AppleCLCD *fb, uintptr_t src, uint32_t bpr,
+-    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h,
++    const uint8_t *dirty)
+ {
+ 	int32_t px0 = fb->fOutX + (int32_t)(((int64_t)dx * fb->fScaleQ16) >> 16);
+ 	int32_t px1 = fb->fOutX + (int32_t)((((int64_t)(dx + w) * fb->fScaleQ16) + 0xffff) >> 16);
+@@ -429,6 +548,10 @@ sweet_fb_scaled_copy(AppleCLCD *fb, uintptr_t src, uint32_t bpr,
+ 			y = h - 1;
+ 			fy = 0;
+ 		}
++		/* dirty: per source row of the rect; NULL = everything */
++		if (dirty != NULL && !dirty[y] && !(fy && dirty[y + 1])) {
++			continue;
++		}
+ 		const uint32_t *r0 = (const uint32_t *)(src + (uint64_t)(sy + y) * bpr);
+ 		const uint32_t *r1 = fy ? (const uint32_t *)(src + (uint64_t)(sy + y + 1) * bpr) : r0;
+ 		uint32_t *out = (uint32_t *)(fb->fPixels + (uint64_t)py * fb->fRowBytes);
+@@ -447,6 +570,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fSwapsSeen++;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -469,7 +593,17 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
+-	if (fScaled) {
++	uint64_t t0 = mach_absolute_time();
++	unsigned layers = 0;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			layers++;
++		}
++	}
++	/* Partial copies only for one layer and a muted console (no text to cover). */
++	bool full = fFullRedraw || layers != 1 || !sweet_console_muted;
++	fFullRedraw = false;
++	if (fScaled && full) {
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+ 			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
+ 			for (int32_t x = 0; x < fOutX; x++) {
+@@ -479,6 +613,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				row[x] = 0xff000000u;
+ 			}
+ 		}
++		fStatusDrawnGen--;      /* the bar was cleared: draw the status again */
+ 	}
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -526,7 +661,30 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    (uint64_t)(sx + w) * 4;
+ 			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&
+ 			    s->elementHeight == 1 && s->memory != NULL && end <= s->memory->getLength()) {
+-				sweet_fb_scaled_copy(this, src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
++				const uint8_t *dirty = NULL;
++				if (h <= SWEET_FB_HASH_ROWS) {
++					bool same = !full && fLastGeom.width == s->width &&
++					    fLastGeom.height == s->height && fLastGeom.bpr == s->bytesPerRow &&
++					    fLastGeom.sx == sx && fLastGeom.sy == sy && fLastGeom.dx == dx &&
++					    fLastGeom.dy == dy && fLastGeom.w == w && fLastGeom.h == h;
++					uintptr_t base = src + s->offset + (uintptr_t)sx * 4;
++					for (int32_t y = 0; y < h; y++) {
++						uint64_t hash = sweet_row_hash(base + (uintptr_t)(sy + y) * s->bytesPerRow, w);
++						fSrcDirty[y] = !same || hash != fRowHash[y];
++						fRowHash[y] = hash;
++					}
++					fLastGeom.width = s->width;
++					fLastGeom.height = s->height;
++					fLastGeom.bpr = s->bytesPerRow;
++					fLastGeom.sx = sx;
++					fLastGeom.sy = sy;
++					fLastGeom.dx = dx;
++					fLastGeom.dy = dy;
++					fLastGeom.w = w;
++					fLastGeom.h = h;
++					dirty = fSrcDirty;
++				}
++				sweet_fb_scaled_copy(this, src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h, dirty);
+ 			}
+ 			s->release();
+ 			continue;
+@@ -571,6 +729,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	fCopyAbs = mach_absolute_time() - t0;
++	fPresents++;
+ }
+ 
+ bool
+@@ -712,6 +872,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				fFB->fFullRedraw = true;
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
