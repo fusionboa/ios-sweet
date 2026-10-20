@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..3a0aa3d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1,10 +1,11 @@
+ /*
+  * SWEET: USB bring-up, step 1 - read-only state probe.
+  *
+- * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+- * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
++ * walleye: the Pixel 2's USB is a Synopsys DWC3 at 0x0a800000 behind
++ * Qualcomm's dwc-usb3-msm wrapper (run here at high speed), with a QUSB2 v2
++ * PHY at 0x0c012000 and no SMMU in front; its power domain is the USB30
++ * GDSC (GCC 0xf004, as on sweet) and its clocks come from GCC (offsets from
++ * Linux gcc-msm8998.c). ABL uses this
+  * controller for fastboot; this probe only reports what state it is left
+  * in after `fastboot boot`. It never writes a register, and it touches the
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+@@ -51,18 +52,18 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
++	{ "master", 0x0f008 },
++	{ "sleep", 0x0f00c },
++	{ "utmi", 0x0f010 },
++	{ "cfg-noc-axi", 0x05018 },
++	{ "aggre-axi", 0x82024 },
+ 	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "clkref", 0x88014 },	/* rx1_usb2_clkref, the QUSB2 reference */
+ };
+ 
+-#define DWC3_PA                 0x0a600000
++#define DWC3_PA                 0x0a800000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
++#define QUSB2_PA                0x0c012000
+ #define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+@@ -167,7 +168,7 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             0x0a8f8800
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
