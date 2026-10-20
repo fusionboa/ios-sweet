@@ -1,0 +1,2992 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..4f516c3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..7815108 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,8 +1,11 @@
+ /*
+- * Minimal polled SWEET keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * walleye keys: power (GPIO 40), volume up (GPIO 126) and volume down
++ * (GPIO 121) on the TLMM EAST tile, active low with board pull-ups (live DT
++ * gpio_keys; the PM8998 PON key inputs are disabled on this board).
++ * Polled every 20 ms from one kernel thread; a level must be seen twice in
++ * a row, and a key only counts after it has been seen released once, so a
++ * pin that reads low for another reason never holds a key down.
++ * Call once after the scheduler is running.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -17,70 +20,25 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
+ 
+-#define KEYS_CORE_PA     0x0c440000u
+-#define KEYS_OBS_PA      0x0e600000u
+-#define KEYS_CNFG_PA     0x0c40a000u
+-#define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
+-#define KEYS_NO_APID     0xffffu
++#define KEYS_EAST_PA    0x03d00000u     /* TLMM 0x3400000 + EAST tile 0x900000 */
++#define KEYS_EAST_SIZE  0x80000u
++#define KEYS_CFG(n)     ((uint32_t)(n) * 0x1000u)
++#define KEYS_IO(n)      (KEYS_CFG(n) + 4u)
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg;
+-static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+-static uint32_t keys_version, keys_last_status;
++/* sweet_hid_key numbering: 0 power, 1 volume up, 2 volume down */
++static const unsigned keys_pin[3] = {40, 126, 121};
++static vm_offset_t keys_east;
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
+ static uint32_t
+-keys_rd(vm_offset_t base, uint32_t off)
++keys_rd(uint32_t off)
+ {
+-	uint32_t v = *(volatile uint32_t *)(base + off);
++	uint32_t v = *(volatile uint32_t *)(keys_east + off);
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+ 	return v;
+ }
+ 
+-/* v5 can map one PPID more than once; prefer the apps-owned entry. */
+-static uint16_t
+-keys_find_apid(uint16_t ppid, uint32_t count)
+-{
+-	uint16_t found = KEYS_NO_APID;
+-	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
+-		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
+-		}
+-		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
+-		if (found == KEYS_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
+-		}
+-	}
+-	return found;
+-}
+-
+-static bool
+-keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+-{
+-	if (apid == KEYS_NO_APID) {
+-		return false;
+-	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+-	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		keys_last_status = keys_rd(keys_obs, off + 0x08u);
+-		if (keys_last_status & 1u) {
+-			if (keys_last_status & 0x0eu) {
+-				return false;
+-			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
+-}
+-
+ static void
+ keys_wait(void)
+ {
+@@ -90,32 +48,28 @@ keys_wait(void)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+-static void
++__attribute__((noreturn)) static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int state[3] = {0, 0, 0};
+-	unsigned errors = 0;
++	int state[3] = {0, 0, 0}, last[3] = {-1, -1, -1};
++	bool armed[3] = {false, false, false};
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0, gpio = 0;
+-		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
+-			if ((errors++ % 250u) == 0) {
+-				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+-				    pok, gok, keys_last_status);
+-			}
+-		} else {
+-			errors = 0;
+-		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+-				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+-				    k, state[k], pon, gpio);
+-				sweet_hid_key(k, state[k]);
++			int down = !(keys_rd(KEYS_IO(keys_pin[k])) & 1u);
++			if (down != last[k]) {
++				last[k] = down;         /* debounce: wait for a second sample */
++				continue;
++			}
++			if (!down && !armed[k]) {
++				armed[k] = true;
++				printf("SWEET KEYS: key %d (GPIO %u) armed\n", k, keys_pin[k]);
++			}
++			if (armed[k] && down != state[k]) {
++				state[k] = down;
++				printf("SWEET KEYS: key=%d down=%d\n", k, down);
++				sweet_hid_key(k, down);
+ 			}
+ 		}
+ 		keys_wait();
+@@ -136,41 +90,19 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
++	keys_east = ml_io_map(KEYS_EAST_PA, KEYS_EAST_SIZE);
++	if (!keys_east) {
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+-	keys_version = keys_rd(keys_core, 0);
+-	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+-	    count == 0 || count > 512) {
+-		printf("SWEET KEYS: unsupported arbiter version=%#x apids=%u\n",
+-		    keys_version, count);
+-		return;
+-	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+-	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+-		keys_gpio_apid = KEYS_NO_APID;
+-	}
+-	if (!pok && !gok) {
+-		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
++	for (int k = 0; k < 3; ++k) {
++		vm_offset_t cfg = keys_east + KEYS_CFG(keys_pin[k]);
++		uint32_t was = keys_rd(KEYS_CFG(keys_pin[k]));
++		/* GPIO function, input, 2 mA, no bias (the DT's gpio_key_active) */
++		*(volatile uint32_t *)cfg = was & ~0x3ffu;
++		__asm__ volatile("dsb osh" ::: "memory");
++		printf("SWEET KEYS: GPIO %u cfg %#x -> %#x level %u\n", keys_pin[k], was,
++		    keys_rd(KEYS_CFG(keys_pin[k])), keys_rd(KEYS_IO(keys_pin[k])) & 1u);
+ 	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+new file mode 100644
+index 0000000..327527a
+--- /dev/null
++++ b/bsd/dev/sweet_rpm.c
+@@ -0,0 +1,518 @@
++/*
++ * walleye: regulator votes to the MSM8998 RPM over GLINK, polled.
++ *
++ * Linux: drivers/rpmsg/qcom_glink_rpm.c (two FIFOs in the RPM message RAM,
++ * found through the TOC in its last 256 bytes; 32-bit accesses only),
++ * qcom_glink_native.c (VERSION, OPEN, TX_DATA; the RPM link is intentless)
++ * and drivers/soc/qcom/smd-rpm.c ("req" packets with key/value pairs).
++ * Live DT: qcom,glink-rpm-native-xprt, msgram 0x778000 + 0x7000, doorbell
++ * 0x17911008 mask 1. The RX interrupt is not used; replies are polled for.
++ * Kernel thread context only, one request at a time.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <IOKit/IOLocks.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma);
++
++#define RPM_RAM_PA              0x00778000u
++#define RPM_RAM_SIZE            0x7000u
++#define RPM_IPC_PA              0x17911000u     /* APCS global; +8: IPC, bit 0 = RPM */
++#define RPM_TOC_SIZE            256u
++#define RPM_TOC_MAGIC           0x67727430u     /* "grt0" */
++#define RPM_TX_FIFO_ID          0x61703272u     /* "ap2r" */
++#define RPM_RX_FIFO_ID          0x72326170u     /* "r2ap" */
++
++#define GLINK_VERSION_1         1u
++#define GLINK_CMD_VERSION       0u
++#define GLINK_CMD_VERSION_ACK   1u
++#define GLINK_CMD_OPEN          2u
++#define GLINK_CMD_CLOSE         3u
++#define GLINK_CMD_OPEN_ACK      4u
++#define GLINK_CMD_INTENT        5u
++#define GLINK_CMD_RX_DONE       6u
++#define GLINK_CMD_RX_INTENT_REQ 7u
++#define GLINK_CMD_RX_INTENT_REQ_ACK 8u
++#define GLINK_CMD_TX_DATA       9u
++#define GLINK_CMD_CLOSE_ACK     11u
++#define GLINK_CMD_TX_DATA_CONT  12u
++#define GLINK_CMD_READ_NOTIF    13u
++#define GLINK_CMD_RX_DONE_W_REUSE 14u
++#define GLINK_CMD_SIGNALS       15u
++
++#define RPM_CHANNEL             "rpm_requests"
++#define RPM_LCID                1u
++#define RPM_NO_RCID             0xffffffffu
++#define RPM_SERVICE_REQ         0x00716572u     /* "req" */
++#define RPM_MSG_ID              0x2367736du     /* "msg#" */
++#define RPM_MSG_ERR             0x00727265u     /* "err" */
++#define RPM_KEY_SWEN            0x6e657773u     /* "swen" */
++#define RPM_KEY_UV              0x00007675u     /* "uv" */
++#define RPM_KEY_MA              0x0000616du     /* "ma" */
++#define RPM_SET_ACTIVE          0u
++#define RPM_SET_SLEEP           1u
++
++#define ALIGN8(x)               (((x) + 7u) & ~7u)
++
++struct rpm_pipe {
++	vm_offset_t tail, head, fifo;   /* indices are byte offsets into fifo */
++	uint32_t len;
++};
++
++static struct {
++	vm_offset_t ram, ipc;
++	struct rpm_pipe tx, rx;
++	IOLock *lock;
++	bool mapped, up, broken;
++	bool version_ack, open_ack, remote_open;
++	uint32_t rcid, msg_id;
++	bool replied;
++	uint32_t reply_id;
++	int reply_status;
++} rpm;
++
++static uint32_t
++rpm_rd(vm_offset_t va)
++{
++	uint32_t v = *(volatile uint32_t *)va;
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++rpm_wr(vm_offset_t va, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)va = v;
++}
++
++static uint32_t
++rpm_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static bool
++rpm_pipe_ok(const struct rpm_pipe *p)
++{
++	return rpm_rd(p->head) < p->len && rpm_rd(p->tail) < p->len;
++}
++
++static uint32_t
++rpm_rx_avail(void)
++{
++	uint32_t head = rpm_rd(rpm.rx.head), tail = rpm_rd(rpm.rx.tail);
++	return head >= tail ? head - tail : rpm.rx.len - tail + head;
++}
++
++/* count and offset are multiples of 4 (the tail is always 8 aligned). */
++static void
++rpm_rx_peek(void *data, uint32_t offset, uint32_t count)
++{
++	uint32_t pos = rpm_rd(rpm.rx.tail) + offset;
++	uint32_t *out = (uint32_t *)data;
++	while (pos >= rpm.rx.len) {
++		pos -= rpm.rx.len;
++	}
++	for (uint32_t i = 0; i < count / 4; ++i) {
++		out[i] = rpm_rd(rpm.rx.fifo + pos);
++		pos += 4;
++		if (pos >= rpm.rx.len) {
++			pos = 0;
++		}
++	}
++}
++
++static void
++rpm_rx_advance(uint32_t count)
++{
++	uint32_t tail = rpm_rd(rpm.rx.tail) + count;
++	while (tail >= rpm.rx.len) {
++		tail -= rpm.rx.len;
++	}
++	rpm_wr(rpm.rx.tail, tail);
++}
++
++static uint32_t
++rpm_tx_avail(void)
++{
++	uint32_t head = rpm_rd(rpm.tx.head), tail = rpm_rd(rpm.tx.tail);
++	return tail <= head ? rpm.tx.len - head + tail : tail - head;
++}
++
++/* One message: header + data, zero padded to 8 bytes, then the doorbell. */
++static int
++rpm_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t words[32];
++	uint32_t len = ALIGN8(hlen + dlen);
++	if (len > sizeof(words) || (hlen & 3u)) {
++		return EINVAL;
++	}
++	bzero(words, sizeof(words));
++	memcpy(words, hdr, hlen);
++	if (dlen) {
++		memcpy((uint8_t *)words + hlen, data, dlen);
++	}
++	unsigned waited = 0;
++	while (rpm_tx_avail() <= len + 8) {
++		if (++waited > 100) {
++			printf("SWEET RPM: TX FIFO full\n");
++			return EBUSY;
++		}
++		delay(1000);
++	}
++	uint32_t head = rpm_rd(rpm.tx.head);
++	for (uint32_t i = 0; i < len / 4; ++i) {
++		rpm_wr(rpm.tx.fifo + head, words[i]);
++		head += 4;
++		if (head >= rpm.tx.len) {
++			head = 0;
++		}
++	}
++	rpm_wr(rpm.tx.head, head);
++	__asm__ volatile("dsb osh" ::: "memory");
++	rpm_wr(rpm.ipc + 8, 1);
++	__asm__ volatile("dsb osh" ::: "memory");
++	return 0;
++}
++
++static int
++rpm_cmd(uint32_t cmd, uint32_t param1, uint32_t param2)
++{
++	uint32_t msg[2] = {cmd | (param1 << 16), param2};
++	return rpm_tx(msg, sizeof(msg), NULL, 0);
++}
++
++/* A reply on rpm_requests: "req" header, then "msg#" (and "err") entries. */
++static void
++rpm_parse_reply(const uint8_t *p, uint32_t len)
++{
++	if (len < 8 || rpm_le32(p) != RPM_SERVICE_REQ || rpm_le32(p + 4) > len - 8) {
++		return;
++	}
++	const uint8_t *b = p + 8, *end = b + rpm_le32(p + 4);
++	bool have_id = false;
++	uint32_t id = 0;
++	int status = 0;
++	while (end - b >= 8) {
++		uint32_t type = rpm_le32(b), mlen = rpm_le32(b + 4);
++		if (mlen > (uint32_t)(end - b) - 8) {
++			break;
++		}
++		if (type == RPM_MSG_ID && mlen >= 4) {
++			id = rpm_le32(b + 8);
++			have_id = true;
++		} else if (type == RPM_MSG_ERR) {
++			char text[33];
++			uint32_t n = MIN(mlen, (uint32_t)sizeof(text) - 1);
++			memcpy(text, b + 8, n);
++			text[n] = 0;
++			printf("SWEET RPM: error reply \"%s\"\n", text);
++			status = EINVAL;
++		}
++		b += 8 + ((mlen + 3u) & ~3u);
++	}
++	if (have_id) {
++		rpm.reply_id = id;
++		rpm.reply_status = status;
++		rpm.replied = true;
++	}
++}
++
++/* Consume everything the RPM sent. Returns false if the link is unusable. */
++static bool
++rpm_rx_poll(void)
++{
++	for (unsigned guard = 0; guard < 256; ++guard) {
++		if (!rpm_pipe_ok(&rpm.rx)) {
++			return false;
++		}
++		uint32_t avail = rpm_rx_avail();
++		if (avail < 8) {
++			return true;
++		}
++		uint32_t msg[4];
++		rpm_rx_peek(msg, 0, 8);
++		uint32_t cmd = msg[0] & 0xffffu, param1 = msg[0] >> 16, param2 = msg[1];
++		uint32_t need = 8;
++		switch (cmd) {
++		case GLINK_CMD_VERSION:
++			(void)rpm_cmd(GLINK_CMD_VERSION_ACK, GLINK_VERSION_1, 0);
++			break;
++		case GLINK_CMD_VERSION_ACK:
++			rpm.version_ack = true;
++			break;
++		case GLINK_CMD_OPEN: {
++			char name[40];
++			need = 8 + ALIGN8(param2);
++			if (param2 == 0 || param2 > 32) {
++				return false;
++			}
++			if (avail < need) {
++				return true;
++			}
++			bzero(name, sizeof(name));
++			rpm_rx_peek(name, 8, ALIGN8(param2));
++			name[param2 - 1] = 0;
++			if (strcmp(name, RPM_CHANNEL) == 0) {
++				rpm.rcid = param1;
++				rpm.remote_open = true;
++			}
++			printf("SWEET RPM: remote open \"%s\" rcid %u\n", name, param1);
++			(void)rpm_cmd(GLINK_CMD_OPEN_ACK, param1, 0);
++			break;
++		}
++		case GLINK_CMD_OPEN_ACK:
++			if (param1 == RPM_LCID) {
++				rpm.open_ack = true;
++			}
++			break;
++		case GLINK_CMD_CLOSE:
++			if (param1 == rpm.rcid) {
++				rpm.remote_open = false;
++			}
++			(void)rpm_cmd(GLINK_CMD_CLOSE_ACK, param1, 0);
++			break;
++		case GLINK_CMD_TX_DATA:
++		case GLINK_CMD_TX_DATA_CONT: {
++			if (avail < 16) {
++				return true;
++			}
++			rpm_rx_peek(msg, 0, 16);
++			uint32_t chunk = msg[2], left = msg[3];
++			if (chunk > rpm.rx.len - 16) {
++				return false;
++			}
++			need = ALIGN8(16 + chunk);
++			if (avail < need) {
++				return true;
++			}
++			if (rpm.rcid == RPM_NO_RCID) {
++				rpm.rcid = param1;      /* the RPM did not re-send its OPEN */
++			}
++			if (param1 == rpm.rcid && cmd == GLINK_CMD_TX_DATA && left == 0 && chunk <= 256) {
++				uint32_t data[64];
++				rpm_rx_peek(data, 16, (chunk + 3u) & ~3u);
++				rpm_parse_reply((const uint8_t *)data, chunk);
++			}
++			break;
++		}
++		case GLINK_CMD_INTENT:
++			need = ALIGN8(8 + 8 * param2);
++			if (param2 > 64) {
++				return false;
++			}
++			if (avail < need) {
++				return true;
++			}
++			break;
++		case GLINK_CMD_READ_NOTIF:
++			rpm_rx_advance(8);
++			rpm_wr(rpm.ipc + 8, 1);
++			continue;
++		case GLINK_CMD_CLOSE_ACK:
++		case GLINK_CMD_RX_DONE:
++		case GLINK_CMD_RX_DONE_W_REUSE:
++		case GLINK_CMD_RX_INTENT_REQ:
++		case GLINK_CMD_RX_INTENT_REQ_ACK:
++		case GLINK_CMD_SIGNALS:
++			break;
++		default:
++			printf("SWEET RPM: unknown command %u (%#x %#x)\n", cmd, msg[0], msg[1]);
++			return false;
++		}
++		rpm_rx_advance(need);
++	}
++	return true;
++}
++
++/* Poll for up to ms milliseconds until *flag is set. */
++static bool
++rpm_wait(volatile bool *flag, unsigned ms)
++{
++	for (unsigned i = 0; i <= ms; ++i) {
++		if (!rpm_rx_poll()) {
++			rpm.broken = true;
++			return false;
++		}
++		if (*flag) {
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
++}
++
++static int
++rpm_map(void)
++{
++	if (rpm.mapped) {
++		return 0;
++	}
++	rpm.ram = ml_io_map(RPM_RAM_PA, RPM_RAM_SIZE);
++	rpm.ipc = ml_io_map(RPM_IPC_PA, 0x1000);
++	if (!rpm.ram || !rpm.ipc) {
++		return ENOMEM;
++	}
++	vm_offset_t toc = rpm.ram + RPM_RAM_SIZE - RPM_TOC_SIZE;
++	uint32_t magic = rpm_rd(toc), count = rpm_rd(toc + 4);
++	if (magic != RPM_TOC_MAGIC || count > (RPM_TOC_SIZE - 8) / 12) {
++		printf("SWEET RPM: bad TOC magic %#x count %u\n", magic, count);
++		return ENXIO;
++	}
++	for (uint32_t i = 0; i < count; ++i) {
++		vm_offset_t e = toc + 8 + 12 * i;
++		uint32_t id = rpm_rd(e), offset = rpm_rd(e + 4), size = rpm_rd(e + 8);
++		if (offset > RPM_RAM_SIZE || size > RPM_RAM_SIZE - offset || size < 64 || (size & 7u)) {
++			continue;
++		}
++		struct rpm_pipe *p = id == RPM_TX_FIFO_ID ? &rpm.tx : id == RPM_RX_FIFO_ID ? &rpm.rx : NULL;
++		if (p) {
++			p->tail = rpm.ram + offset;
++			p->head = rpm.ram + offset + 4;
++			p->fifo = rpm.ram + offset + 8;
++			p->len = size;
++		}
++	}
++	if (!rpm.tx.len || !rpm.rx.len || !rpm_pipe_ok(&rpm.tx) || !rpm_pipe_ok(&rpm.rx)) {
++		printf("SWEET RPM: FIFOs not found or invalid (tx %u rx %u)\n", rpm.tx.len, rpm.rx.len);
++		return ENXIO;
++	}
++	printf("SWEET RPM: TOC ok: tx %#x+%#x head %u tail %u, rx %#x+%#x head %u tail %u\n",
++	    (uint32_t)(rpm.tx.tail - rpm.ram), rpm.tx.len, rpm_rd(rpm.tx.head), rpm_rd(rpm.tx.tail),
++	    (uint32_t)(rpm.rx.tail - rpm.ram), rpm.rx.len, rpm_rd(rpm.rx.head), rpm_rd(rpm.rx.tail));
++	rpm.mapped = true;
++	return 0;
++}
++
++static int
++rpm_link_up(void)
++{
++	int error = rpm_map();
++	if (error) {
++		return error;
++	}
++	rpm.version_ack = rpm.open_ack = rpm.remote_open = false;
++	rpm.rcid = RPM_NO_RCID;
++	if (!rpm_rx_poll()) {
++		return EIO;
++	}
++	error = rpm_cmd(GLINK_CMD_VERSION, GLINK_VERSION_1, 0);
++	if (error) {
++		return error;
++	}
++	bool got_version = rpm_wait(&rpm.version_ack, 500);
++	struct {
++		uint32_t msg[2];
++		char name[16];
++	} open;
++	bzero(&open, sizeof(open));
++	open.msg[0] = GLINK_CMD_OPEN | (RPM_LCID << 16);
++	open.msg[1] = sizeof(RPM_CHANNEL);
++	strlcpy(open.name, RPM_CHANNEL, sizeof(open.name));
++	error = rpm_tx(&open, ALIGN8(8 + sizeof(RPM_CHANNEL)), NULL, 0);
++	if (error) {
++		return error;
++	}
++	bool acked = rpm_wait(&rpm.open_ack, 1000);
++	if (acked) {
++		(void)rpm_wait(&rpm.remote_open, 200);
++	}
++	printf("SWEET RPM: link version-ack=%d open-ack=%d remote-open=%d rcid=%d\n",
++	    got_version, acked, rpm.remote_open, (int)rpm.rcid);
++	if (!acked) {
++		return ETIMEDOUT;
++	}
++	rpm.up = true;
++	return 0;
++}
++
++static int
++rpm_request(uint32_t set, uint32_t type, uint32_t id, const uint32_t *kvp, uint32_t nkvp)
++{
++	struct {
++		uint32_t service, length;                       /* qcom_rpm_header */
++		uint32_t msg_id, flags, type, id, data_len;     /* qcom_rpm_request */
++		uint32_t kvp[9];
++	} pkt;
++	struct {
++		uint32_t msg[2];
++		uint32_t chunk_size, left_size;
++	} hdr;
++	if (nkvp > 3) {
++		return EINVAL;
++	}
++	uint32_t kvp_len = 12 * nkvp;
++	pkt.service = RPM_SERVICE_REQ;
++	pkt.length = 20 + kvp_len;
++	pkt.msg_id = ++rpm.msg_id;
++	pkt.flags = set;
++	pkt.type = type;
++	pkt.id = id;
++	pkt.data_len = kvp_len;
++	memcpy(pkt.kvp, kvp, kvp_len);
++	uint32_t size = 28 + kvp_len;
++	hdr.msg[0] = GLINK_CMD_TX_DATA | (RPM_LCID << 16);
++	hdr.msg[1] = 0;                 /* intentless: no intent id */
++	hdr.chunk_size = size;
++	hdr.left_size = 0;
++	rpm.replied = false;
++	int error = rpm_tx(&hdr, sizeof(hdr), &pkt, size);
++	if (error) {
++		return error;
++	}
++	for (unsigned i = 0; i < 4; ++i) {
++		if (!rpm_wait(&rpm.replied, 250)) {
++			return rpm.broken ? EIO : ETIMEDOUT;
++		}
++		if (rpm.reply_id == pkt.msg_id) {
++			return rpm.reply_status;
++		}
++		rpm.replied = false;            /* a stale reply: keep waiting */
++	}
++	return ETIMEDOUT;
++}
++
++/* Enable an RPM regulator ("ldoa", 28, 3300000 uV, 100 mA) in both sets. */
++int
++sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma)
++{
++	static bool tried;
++	if (!tried) {
++		tried = true;
++		rpm.lock = IOLockAlloc();
++	}
++	if (!rpm.lock || !type || strlen(type) != 4) {
++		return EINVAL;
++	}
++	uint32_t type_word = (uint32_t)(uint8_t)type[0] | (uint32_t)(uint8_t)type[1] << 8 |
++	    (uint32_t)(uint8_t)type[2] << 16 | (uint32_t)(uint8_t)type[3] << 24;
++	uint32_t kvp[9] = {
++		RPM_KEY_SWEN, 4, 1,
++		RPM_KEY_UV, 4, uv,
++		RPM_KEY_MA, 4, ma,
++	};
++	int error = 0;
++	IOLockLock(rpm.lock);
++	if (rpm.broken) {
++		error = EIO;
++	} else if (!rpm.up) {
++		error = rpm_link_up();
++	}
++	if (!error) {
++		error = rpm_request(RPM_SET_ACTIVE, type_word, id, kvp, ma ? 3 : 2);
++	}
++	if (!error) {
++		error = rpm_request(RPM_SET_SLEEP, type_word, id, kvp, ma ? 3 : 2);
++	}
++	IOLockUnlock(rpm.lock);
++	printf("SWEET RPM: %s%u on at %u uV, %u mA: %s (%d)\n", type, id, uv, ma,
++	    error ? "FAILED" : "ok", error);
++	return error;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..2898bd8 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,9 +1,12 @@
+ /*
+- * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in SweetBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * walleye: MSM8998 SPMI PMIC arbiter v3 (Linux spmi-pmic-arb.c, ver 3),
++ * the bus to PM8998 (SID 0/1) and PMI8998 (SID 2/3).
++ *
++ * Reads use EE 0's observer channel of the peripheral's APID. Writes use
++ * its owner channel, only for a peripheral the apps EE owns and only for
++ * the allow-list below. Channels are one page per APID, mapped on first
++ * use; the core (APID -> PPID table) and config (owner table) at init.
++ * Verified with walleye/probe v8 (PMI8998 GPIO 2 at APID 0xec).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -14,17 +17,35 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
+-#define SP_NO_APID 0xffffu
++#define SP_CORE_PA      0x0800f000u
++#define SP_CHNLS_PA     0x08400000u
++#define SP_OBS_PA       0x09400000u
++#define SP_CFG_PA       0x0800a000u
++#define SP_CHAN_STRIDE  0x8000u         /* v2/v3: 0x1000 * ee + 0x8000 * apid */
++#define SP_APIDS        512u
++#define SP_NO_APID      0xffffu
++#define SP_CMD          0x00u
++#define SP_STATUS       0x08u
++#define SP_WDATA0       0x10u
++#define SP_RDATA0       0x18u
++#define SP_OP_WRITE     0u              /* EXT_WRITEL */
++#define SP_OP_READ      1u              /* EXT_READL */
+ 
+-static vm_offset_t sp_core, sp_obs, sp_cfg;
++/* (SID << 8) | peripheral that may be written. */
++static const uint16_t sp_writable[] = {
++	0x2c1,  /* PMI8998 GPIO 2: touch IC power switch */
++};
++
++static vm_offset_t sp_core, sp_cfg;
++static vm_offset_t sp_obs[SP_APIDS], sp_chnl[SP_APIDS];
+ static IOLock *sp_lock;
+-static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+-static bool sp_poisoned[512];
++static bool sp_poisoned[SP_APIDS];
++static struct {
++	uint16_t ppid, apid;
++} sp_cache[16];
++static unsigned sp_cached;
+ 
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+@@ -34,23 +55,64 @@ sp_rd(vm_offset_t base, unsigned off)
+ 	return value;
+ }
+ 
++static void
++sp_wr(vm_offset_t base, unsigned off, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
+ static uint16_t
+ sp_find_apid(unsigned ppid)
+ {
+-	uint16_t found = SP_NO_APID;
+-	for (unsigned i = 0; i < sp_count; ++i) {
+-		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
+-		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
++	for (unsigned i = 0; i < sp_cached; ++i) {
++		if (sp_cache[i].ppid == ppid) {
++			return sp_cache[i].apid;
+ 		}
+-		unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * i) & 7u;
+-		if (found == SP_NO_APID || owner == 0) {
++	}
++	uint16_t found = SP_NO_APID;
++	for (unsigned i = 0; i < SP_APIDS; ++i) {
++		uint32_t map = sp_rd(sp_core, 0x800u + 4u * i);
++		if (map && ((map >> 8) & 0xfffu) == ppid) {
+ 			found = (uint16_t)i;
++			break;
+ 		}
+ 	}
++	if (found != SP_NO_APID && sp_cached < sizeof(sp_cache) / sizeof(sp_cache[0])) {
++		sp_cache[sp_cached].ppid = (uint16_t)ppid;
++		sp_cache[sp_cached].apid = found;
++		++sp_cached;
++	}
+ 	return found;
+ }
+ 
++static vm_offset_t
++sp_channel(vm_offset_t *table, uint32_t base, uint16_t apid)
++{
++	if (!table[apid]) {
++		table[apid] = ml_io_map(base + SP_CHAN_STRIDE * apid, 0x1000);
++	}
++	return table[apid];
++}
++
++/* One-byte command on a mapped channel; caller holds sp_lock. */
++static int
++sp_command(vm_offset_t chan, uint16_t apid, uint32_t opc, unsigned addr)
++{
++	sp_wr(chan, SP_CMD, (opc << 27) | ((addr & 0xffu) << 4));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(chan, SP_STATUS);
++		if (status & 1u) {
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET SPMI: timeout opc=%u addr=%#x APID=%u disabled\n", opc, addr, apid);
++	return -1;
++}
++
+ int
+ sweet_spmi_init(void)
+ {
+@@ -59,68 +121,70 @@ sweet_spmi_init(void)
+ 	}
+ 	sp_attempted = true;
+ 	sp_lock = IOLockAlloc();
+-	if (!sp_lock) {
+-		return -1;
+-	}
+-	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
++	sp_core = ml_io_map(SP_CORE_PA, 0x1000);
+ 	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+-	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+-	if (!sp_core || !sp_cfg || !sp_obs) {
+-		printf("SWEET BATTERY: SPMI mapping failed\n");
++	if (!sp_lock || !sp_core || !sp_cfg) {
++		printf("SWEET SPMI: setup failed\n");
+ 		return -1;
+ 	}
+-	uint32_t arb_version = sp_rd(sp_core, 0);
+-	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+-	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
+-	    !sp_count || sp_count > 512) {
+-		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+-		    arb_version, sp_count);
++	uint32_t version = sp_rd(sp_core, 0);
++	if (version < 0x20000000u || version >= 0x50000000u) {
++		printf("SWEET SPMI: unsupported arbiter version %#x\n", version);
+ 		return -1;
+ 	}
+ 	sp_ready = true;
+-	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
++	printf("SWEET SPMI: arbiter %#x (v3 layout)\n", version);
+ 	return 0;
+ }
+ 
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
+-	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	if (!sp_ready || !out || sid > 15 || addr > 0xffffu) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+-	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	vm_offset_t chan = 0;
++	if (apid != SP_NO_APID && !sp_poisoned[apid]) {
++		chan = sp_channel(sp_obs, SP_OBS_PA, apid);
++	}
++	int error = -1;
++	if (chan && sp_command(chan, apid, SP_OP_READ, addr) == 0) {
++		*out = (uint8_t)sp_rd(chan, SP_RDATA0);
++		error = 0;
++	}
++	IOLockUnlock(sp_lock);
++	return error;
++}
++
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	unsigned ppid = (sid << 8) | (addr >> 8);
++	bool allowed = false;
++	for (unsigned i = 0; i < sizeof(sp_writable) / sizeof(sp_writable[0]); ++i) {
++		allowed |= (sp_writable[i] == ppid);
++	}
++	if (!sp_ready || !allowed || sid > 15 || addr > 0xffffu) {
+ 		return -1;
+ 	}
+-	unsigned off = 0x80u * apid;
+-	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+-		if (status & 1u) {
+-			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
+-				return -1;
+-			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
+-			return 0;
+-		}
+-		delay(1);
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid(ppid);
++	vm_offset_t chan = 0;
++	if (apid != SP_NO_APID && !sp_poisoned[apid] &&
++	    (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) == 0) {
++		chan = sp_channel(sp_chnl, SP_CHNLS_PA, apid);
++	}
++	int error = -1;
++	if (chan) {
++		sp_wr(chan, SP_WDATA0, value);
++		error = sp_command(chan, apid, SP_OP_WRITE, addr);
+ 	}
+-	sp_poisoned[apid] = true;
+-	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+-	    sid, addr, apid);
+ 	IOLockUnlock(sp_lock);
+-	return -1;
++	if (error) {
++		printf("SWEET SPMI: write sid=%u addr=%#x failed (APID %u)\n", sid, addr, apid);
++	}
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..b62eda6 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -1,4 +1,4 @@
+-/* Shared C/C++ interface. Init once, on the SweetBattery start thread. */
++/* Shared C/C++ interface to the walleye PMICs (bsd/dev/sweet_spmi.c). */
+ #ifndef SWEET_BATTERY_SPMI_H
+ #define SWEET_BATTERY_SPMI_H
+ #include <stdint.h>
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* Thread context only; allow-listed peripherals owned by the apps EE. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..d7887dd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1,9 +1,17 @@
+ /*
+- * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
+- * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+- * No firmware/config upload or direct PMIC writes. Only IC data write:
+- * zero to GT9896's event status after reading a report. See touch2/report.md.
++ * walleye touch: Synaptics RMI4 ("synaptics,dsx-i2c" at 0x20) on BLSP1
++ * QUP5 I2C (0xc179000, GPIO 87/88 function 3, 400 kHz), polled from one
++ * kernel thread. Call once after the scheduler is running.
++ *
++ * Power, from the live DT (msm8998-touch-mw-common/-walleye-xd.dtsi) and
++ * walleye/probe v8: PM8998 LDO28 3.3 V (RPM vote, sweet_rpm.c), the PMI8998
++ * GPIO 2 load switch (SPMI, sweet_spmi.c), bus switch GPIO 75 low, reset
++ * GPIO 89 (active low, 20 ms), attention GPIO 125 (active low, pull-up).
++ * Protocol: Linux drivers/input/rmi4 (PDT, F01 device control, F12 2D
++ * sensor with register descriptors). QUP: Linux i2c-qup.c, v1 tags, FIFO
++ * mode, polled. Writes to the IC: page select, F01 device control
++ * (configured bit, normal operation) and F12's bit in the F01 interrupt
++ * enable register.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -14,75 +22,106 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+-extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void _disable_preemption(void);
++extern void _enable_preemption(void);
++extern int sweet_rpm_vreg_enable(const char *type, unsigned id, unsigned uv, unsigned ma);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
+-#define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
+-#define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+-#define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+-#define TOUCH_MAX        10u
+-#define TOUCH_GOODIX     1
+-#define TOUCH_FTS        2
+-/* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+-#define GOODIX_PID_REG   0x4022u
+-#define GOODIX_EVENT_REG 0x4180u
+-#define GOODIX_HEAD_LEN  8u
+-#define GOODIX_POINT_LEN 8u
+-
+-#define SE_STATUS       0x040u
+-#define SE_MCLK         0x048u
+-#define SE_FW           0x068u
+-#define SE_CLK_SEL      0x07cu
+-#define SE_DMA          0x258u
+-#define SE_TX_LEN       0x26cu
+-#define SE_RX_LEN       0x270u
+-#define SE_SCL          0x278u
+-#define SE_CMD          0x600u
+-#define SE_CTRL         0x604u
+-#define SE_IRQ          0x610u
+-#define SE_IRQ_EN       0x614u
+-#define SE_IRQ_CLR      0x618u
+-#define SE_TX           0x700u
+-#define SE_RX           0x780u
+-#define SE_TX_COUNT     0x800u
+-#define SE_RX_COUNT     0x804u
+-#define SE_HW_TX        0xe24u
+-#define SE_HW_RX        0xe28u
+-#define SE_TX_WM        0x80cu
+-#define SE_RX_WM_IRQ    (1u << 26)
+-#define SE_RX_LAST      (1u << 27)
+-#define SE_TX_WM_IRQ    (1u << 30)
+-#define SE_DONE         (1u << 0)
+-#define SE_NACK         (1u << 10)
+-#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
+-                         (1u << 13) | (3u << 24) | (3u << 28))
+-#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
+-/* geni_se_config_packing(8, 4, true, true, true): start bits 7/15/23/31,
+- * MSB-to-LSB, length 8, STOP only on vector 3. FIFO bytes remain LSB first. */
+-#define SE_PACK0        0x0007f8feu
+-#define SE_PACK1        0x000ffefeu
++#define TS_GCC_PA        0x00100000u
++#define TS_GCC_SIZE      0x60000u
++#define TS_GCC_VOTE      0x52004u       /* bit 17: blsp1_ahb */
++#define TS_QUP5_CBCR     0x21008u
++#define TS_QUP5_RCG      0x21020u       /* CMD; CFG at +4 */
++#define TS_EAST_PA       0x03d00000u    /* TLMM 0x3400000 + EAST tile 0x900000 */
++#define TS_EAST_SIZE     0x80000u       /* GPIO 0..127 */
++#define TS_SWITCH_PA     0x0354b000u    /* TLMM + WEST tile 0x100000 + GPIO 75 */
++#define TS_QUP_PA        0x0c179000u
++#define TS_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
++#define TS_GPIO_IO(n)    (TS_GPIO_CFG(n) + 4u)
++#define TS_SDA           87
++#define TS_SCL           88
++#define TS_RESET         89
++#define TS_ATTN          125
++#define TS_ADDR          0x20u
++#define TS_PANEL_W       1080
++#define TS_PANEL_H       1920
++#define TS_MAX           10u
++
++#define QUP_CONFIG       0x000u
++#define QUP_STATE        0x004u
++#define QUP_IO_MODE      0x008u
++#define QUP_SW_RESET     0x00cu
++#define QUP_OPERATIONAL  0x018u
++#define QUP_ERROR_FLAGS  0x01cu
++#define QUP_HW_VERSION   0x030u
++#define QUP_MX_OUTPUT_CNT 0x100u
++#define QUP_OUT_FIFO     0x110u
++#define QUP_MX_WRITE_CNT 0x150u
++#define QUP_MX_INPUT_CNT 0x200u
++#define QUP_MX_READ_CNT  0x208u
++#define QUP_IN_FIFO      0x218u
++#define QUP_I2C_CLK_CTL  0x400u
++#define QUP_I2C_STATUS   0x404u
++#define QUP_RESET_STATE  0u
++#define QUP_RUN_STATE    1u
++#define QUP_PAUSE_STATE  3u
++#define QUP_STATE_VALID  (1u << 2)
++#define QUP_I2C_MAST_GEN (1u << 4)
++#define QUP_OUT_NOT_EMPTY (1u << 4)
++#define QUP_IN_NOT_EMPTY (1u << 5)
++#define QUP_NO_INPUT     (1u << 7)
++#define QUP_MINI_CORE    (2u << 8)
++#define QUP_N_VAL        15u
++#define QUP_REPACK_EN    ((1u << 14) | (1u << 15))
++#define QUP_TAG_START    (1u << 8)
++#define QUP_TAG_DATA     (2u << 8)
++#define QUP_TAG_STOP     (3u << 8)
++#define QUP_TAG_REC      (4u << 8)
++#define QUP_BUS_ACTIVE   (1u << 8)
++#define QUP_NACK         (1u << 3)
++#define QUP_I2C_ERRORS   0x38000fcu
++#define QUP_ERRORS       0x7cu
++
++/* One RMI4 register descriptor (Linux rmi_read_register_desc). */
++struct rmi_reg {
++	uint8_t reg;
++	uint32_t size;
++	uint64_t subpackets;
++};
++struct rmi_desc {
++	unsigned count;
++	struct rmi_reg regs[32];
++};
++struct rmi_fn {
++	bool present;
++	uint16_t query, command, control, data;
++	uint8_t irqs, irq_pos;
++};
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
+-	bool started, dead, probing;
+-	int kind, irq_hint;
+-	uint32_t irq_status, irq_last, active;
+-	unsigned sent, got;
+-	int x[TOUCH_MAX], y[TOUCH_MAX];
++	vm_offset_t gcc, east, sw, qup;
++	bool started, dead;
++	uint32_t clk_ctl, in_fifo, i2c_status;
++	uint8_t page;
++	struct rmi_fn f01, f12;
++	unsigned irq_count, irq_regs;
++	uint16_t data1_off, data1_size, read_len;
++	unsigned max_x, max_y, fingers;
++	int flip;
++	uint32_t active;
++	int x[TS_MAX], y[TS_MAX];
++	struct rmi_desc desc;
+ } st;
+ static int touch_sleep_chan;
+ 
+ static uint32_t
+-touch_rd(vm_offset_t base, uint32_t off)
++ts_rd(vm_offset_t base, uint32_t off)
+ {
+ 	uint32_t v = *(volatile uint32_t *)(base + off);
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+@@ -90,7 +129,7 @@ touch_rd(vm_offset_t base, uint32_t off)
+ }
+ 
+ static void
+-touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++ts_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ {
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(base + off) = val;
+@@ -107,10 +146,10 @@ touch_wait(unsigned ms)
+ }
+ 
+ static bool
+-touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++ts_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ {
+ 	for (unsigned i = 0; i < 5000; ++i) {
+-		if (!(touch_rd(base, off) & mask)) {
++		if (!(ts_rd(base, off) & mask)) {
+ 			return true;
+ 		}
+ 		delay(1);
+@@ -118,257 +157,470 @@ touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ 	return false;
+ }
+ 
++/* TLMM pin: function, pull (0 none, 1 down, 3 up), drive (n: 2*(n+1) mA). */
+ static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++ts_gpio(vm_offset_t pin, unsigned func, unsigned pull, unsigned drive, bool out, bool high)
+ {
+-	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
+ 	if (out) {
+-		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		/* Latch the level before the output is enabled (reset is active low). */
++		ts_wr(pin, 4, (ts_rd(pin, 4) & ~2u) | (high ? 2u : 0u));
+ 	}
+-	cfg &= ~0x3ffu;
+-	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	uint32_t cfg = ts_rd(pin, 0) & ~0x3ffu;
++	ts_wr(pin, 0, cfg | pull | (func << 2) | (drive << 6) | (out ? (1u << 9) : 0u));
++}
++
++static vm_offset_t
++ts_pin(unsigned n)
++{
++	return st.east + TS_GPIO_CFG(n);
+ }
+ 
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+-	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
+-	if (dfs & 1u) {
+-		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
+-		if ((cfg & 0x371fu) != 1u) {
+-			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+-			return false;
+-		}
+-	} else {
+-		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+-		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
+-			printf("SWEET TOUCH: RCG update timeout\n");
++	ts_wr(st.gcc, TS_GCC_VOTE, ts_rd(st.gcc, TS_GCC_VOTE) | (1u << 17));
++	uint32_t cfg = ts_rd(st.gcc, TS_QUP5_RCG + 4u);
++	/* Source XO (19.2 MHz), divider 1: the I2C divider below assumes it. */
++	if ((cfg & 0x71fu) > 1u) {
++		ts_wr(st.gcc, TS_QUP5_RCG + 4u, (cfg & ~0x371fu) | 1u);
++		ts_wr(st.gcc, TS_QUP5_RCG, ts_rd(st.gcc, TS_QUP5_RCG) | 1u);
++		if (!ts_wait_clear(st.gcc, TS_QUP5_RCG, 1u)) {
++			printf("SWEET TOUCH: QUP5 RCG update timeout\n");
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
++	ts_wr(st.gcc, TS_QUP5_CBCR, ts_rd(st.gcc, TS_QUP5_CBCR) | 1u);
++	bool on = ts_wait_clear(st.gcc, TS_QUP5_CBCR, 1u << 31);
++	printf("SWEET TOUCH: gcc vote=%#x rcg cfg %#x -> %#x cbcr=%#x\n",
++	    ts_rd(st.gcc, TS_GCC_VOTE), cfg, ts_rd(st.gcc, TS_QUP5_RCG + 4u),
++	    ts_rd(st.gcc, TS_QUP5_CBCR));
++	return on;
++}
++
++/* ---- QUP I2C (Linux i2c-qup.c, v1 tags) ---- */
++
++static int
++qup_state(uint32_t state)
++{
++	unsigned i;
++	for (i = 0; i < 2000 && !(ts_rd(st.qup, QUP_STATE) & QUP_STATE_VALID); ++i) {
++		delay(1);
++	}
++	ts_wr(st.qup, QUP_STATE, state);
++	for (i = 0; i < 2000; ++i) {
++		uint32_t v = ts_rd(st.qup, QUP_STATE);
++		if ((v & QUP_STATE_VALID) && (v & 3u) == state) {
++			return 0;
+ 		}
++		delay(1);
+ 	}
+-	return true;
++	return EIO;
+ }
+ 
+-/* Called only for a transfer started by this driver, including a stretched TX. */
+-static void
+-touch_abort(void)
++static int
++qup_reset(void)
+ {
+-	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
+-	bool done = false;
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
+-			done = true;
++	ts_wr(st.qup, QUP_SW_RESET, 1);
++	unsigned i;
++	for (i = 0; i < 2000; ++i) {
++		uint32_t v = ts_rd(st.qup, QUP_STATE);
++		if ((v & QUP_STATE_VALID) && (v & 3u) == QUP_RESET_STATE) {
+ 			break;
+ 		}
+ 		delay(1);
+ 	}
+-	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true;
+-		printf("SWEET TOUCH: abort failed status=%#x irq=%#x; stopping\n",
+-		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
+-	}
+-	/* Bound drain even if the hardware reports an impossible FIFO count. */
+-	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+-		(void)touch_rd(st.se, SE_RX);
+-	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
+-		st.dead = true;
+-		printf("SWEET TOUCH: TX FIFO not empty after abort; stopping\n");
++	ts_wr(st.qup, QUP_CONFIG, QUP_MINI_CORE | QUP_N_VAL);
++	for (i = 0; i < 2000 && !(ts_rd(st.qup, QUP_STATE) & QUP_I2C_MAST_GEN); ++i) {
++		delay(1);
+ 	}
++	return (ts_rd(st.qup, QUP_STATE) & QUP_I2C_MAST_GEN) ? 0 : EIO;
+ }
+ 
+-/* Keep all observed bits for diagnostics, even if a watermark was cleared. */
+-static uint32_t
+-touch_irq(void)
++static bool
++qup_init(void)
+ {
+-	st.irq_last = touch_rd(st.se, SE_IRQ);
+-	st.irq_status |= st.irq_last;
+-	return st.irq_last;
++	uint32_t ver = ts_rd(st.qup, QUP_HW_VERSION);
++	if (qup_reset()) {
++		printf("SWEET TOUCH: QUP5 reset failed state=%#x\n", ts_rd(st.qup, QUP_STATE));
++		return false;
++	}
++	uint32_t io = ts_rd(st.qup, QUP_IO_MODE);
++	static const uint32_t blk[4] = {4, 16, 32, 0};
++	/* FIFO bytes; with 16-bit v1 entries it holds half as many data bytes. */
++	st.in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u)) / 2u;
++	/* 400 kHz from 19.2 MHz, 33/66 duty (Linux i2c-qup.c) */
++	uint32_t fs_div = ((19200000u / 400000u) - 6u) * 2u / 3u;
++	st.clk_ctl = ((fs_div / 2u) << 16) | (3u << 8) | (fs_div & 0xffu);
++	printf("SWEET TOUCH: QUP5 hw %#x io_mode %#x in-fifo %u data bytes clk_ctl %#x\n",
++	    ver, io, st.in_fifo, st.clk_ctl);
++	return true;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/* One I2C message to TS_ADDR: a write (rx == NULL) or a read. */
+ static int
+-touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++qup_xfer(const uint8_t *tx, unsigned ntx, uint8_t *rx, unsigned nrx)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	bool is_read = rx != NULL;
++	if ((is_read && (nrx == 0 || nrx > 256)) || (!is_read && (ntx == 0 || ntx > 15))) {
++		return EINVAL;
++	}
++	if (qup_state(QUP_RESET_STATE) && qup_reset()) {
+ 		return EIO;
+ 	}
+-	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true; /* no other SE7 owner is supported */
+-		return EBUSY;
+-	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
+-	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+-	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+-	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+-	int err = ETIMEDOUT;
+-	for (unsigned i = 0; i < 20000; ++i) {
+-		uint32_t irq = touch_irq();
+-		if (irq & SE_ERRORS) {
+-			err = (irq & SE_NACK) ? ENXIO : EIO;
+-			/* A completed NACK is normal during address probing. Aborting an
+-			 * idle sequencer may never produce ABORT_DONE. Wait for completion
+-			 * and leave a clean idle engine available for the other IC. */
+-			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
+-				delay(1);
+-				irq = touch_irq();
+-			}
+-			if ((irq & SE_DONE) && !(touch_rd(st.se, SE_STATUS) & 1u) &&
+-			    !(touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
+-			    !(touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-				touch_wr(st.se, SE_IRQ_CLR, irq);
+-				return err;
++	ts_wr(st.qup, QUP_I2C_STATUS, 0xfffffcu);
++	ts_wr(st.qup, QUP_ERROR_FLAGS, QUP_ERRORS);
++	ts_wr(st.qup, QUP_OPERATIONAL, 0xff0u);
++	ts_wr(st.qup, QUP_CONFIG, QUP_MINI_CORE | QUP_N_VAL | (is_read ? 0u : QUP_NO_INPUT));
++	ts_wr(st.qup, QUP_IO_MODE, QUP_REPACK_EN);
++	ts_wr(st.qup, QUP_MX_OUTPUT_CNT, 0);
++	ts_wr(st.qup, QUP_MX_WRITE_CNT, is_read ? 2u : ntx + 1u);
++	if (is_read) {
++		ts_wr(st.qup, QUP_MX_INPUT_CNT, 0);
++		ts_wr(st.qup, QUP_MX_READ_CNT, nrx);
++	}
++	/* The clock divider only takes in RUN state; the FIFO is filled paused. */
++	if (qup_state(QUP_RUN_STATE)) {
++		return EIO;
++	}
++	ts_wr(st.qup, QUP_I2C_CLK_CTL, st.clk_ctl);
++	if (qup_state(QUP_PAUSE_STATE)) {
++		return EIO;
++	}
++	if (is_read) {
++		ts_wr(st.qup, QUP_OUT_FIFO, ((QUP_TAG_REC | (nrx & 0xffu)) << 16) |
++		    QUP_TAG_START | (TS_ADDR << 1) | 1u);
++	} else {
++		uint32_t val = QUP_TAG_START | (TS_ADDR << 1);
++		for (unsigned pos = 0, idx = 1; pos < ntx; ++pos, ++idx) {
++			uint32_t t = (pos == ntx - 1 ? QUP_TAG_STOP : QUP_TAG_DATA) | tx[pos];
++			if (idx & 1u) {
++				val |= t << 16;
++			} else {
++				val = t;
+ 			}
+-			break;
+-		}
+-		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
++			if ((idx & 1u) || pos == ntx - 1) {
++				ts_wr(st.qup, QUP_OUT_FIFO, val);
+ 			}
+-			touch_wr(st.se, SE_TX, word);
+-			st.sent = nt;
+-			touch_wr(st.se, SE_TX_WM, 0);
+ 		}
+-		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
+-		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
+-			err = EIO;
++	}
++	int err = 0;
++	unsigned got = 0;
++	uint64_t deadline;
++	/* 2 ms plus 50 us a byte; the read drains the FIFO without being preempted. */
++	nanoseconds_to_absolutetime(2000000ull + 50000ull * (ntx + nrx + 2), &deadline);
++	_disable_preemption();
++	deadline += mach_absolute_time();
++	if (qup_state(QUP_RUN_STATE)) {
++		err = EIO;
++	}
++	while (!err) {
++		uint32_t i2c = ts_rd(st.qup, QUP_I2C_STATUS), qerr = ts_rd(st.qup, QUP_ERROR_FLAGS);
++		uint32_t op = ts_rd(st.qup, QUP_OPERATIONAL);
++		if ((i2c & QUP_I2C_ERRORS) || (qerr & QUP_ERRORS)) {
++			st.i2c_status = i2c | (qerr << 28);
++			err = (i2c & QUP_NACK) ? ENXIO : EIO;
+ 			break;
+ 		}
+-		while (count--) {
+-			uint32_t word = touch_rd(st.se, SE_RX);
+-			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
+-				rx[st.got++] = (uint8_t)(word >> (8u * j));
++		if (is_read && got < nrx && (op & QUP_IN_NOT_EMPTY)) {
++			uint32_t w = ts_rd(st.qup, QUP_IN_FIFO);
++			rx[got++] = (uint8_t)w;
++			if (got < nrx) {
++				rx[got++] = (uint8_t)(w >> 16);
+ 			}
++			continue;
+ 		}
+-		/* DONE is checked after draining RX, so final short words aren't lost. */
+-		if (irq & SE_DONE) {
+-			/* Re-sample after the final drain; a late error must beat DONE. */
+-			irq = touch_irq();
+-			if (irq & SE_ERRORS) {
+-				continue;
++		if (is_read ? got == nrx : !(op & QUP_OUT_NOT_EMPTY)) {
++			if (!(i2c & QUP_BUS_ACTIVE)) {
++				break;
+ 			}
+-			touch_wr(st.se, SE_IRQ_CLR, irq);
+-			if (st.got == nr && st.sent == nt) {
+-				return 0;
+-			}
+-			err = EIO;
+-			break;
+ 		}
+-		/* Preserve DONE/errors if they arrive during this iteration. */
+-		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
+-		delay(1);
++		if (mach_absolute_time() > deadline) {
++			st.i2c_status = i2c | 0x40000000u;
++			err = ETIMEDOUT;
++		}
++	}
++	_enable_preemption();
++	if (err) {
++		(void)qup_reset();
++		return err;
++	}
++	return qup_state(QUP_RESET_STATE);
++}
++
++/* ---- RMI4 over I2C (Linux rmi_i2c.c: page register 0xff) ---- */
++
++static int
++rmi_page(uint8_t page)
++{
++	if (page == st.page) {
++		return 0;
+ 	}
+-	touch_abort();
++	uint8_t b[2] = {0xff, page};
++	int err = qup_xfer(b, 2, NULL, 0);
++	st.page = (uint8_t)(err ? 0xfe : page);
+ 	return err;
+ }
+ 
+ static int
+-touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++rmi_read(uint16_t addr, uint8_t *buf, unsigned len)
+ {
+-	st.irq_status = st.irq_last = 0;
+-	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+-	if (st.probing) {
+-		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+-		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+-		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    touch_rd(st.se, SE_STATUS));
++	uint8_t a = (uint8_t)addr;
++	int err = rmi_page((uint8_t)(addr >> 8));
++	if (!err) {
++		err = qup_xfer(&a, 1, NULL, 0);
++	}
++	if (!err) {
++		err = qup_xfer(NULL, 0, buf, len);
+ 	}
+ 	return err;
+ }
+ 
+ static int
+-touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++rmi_write(uint16_t addr, const uint8_t *buf, unsigned len)
+ {
+-	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
+-	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+-	    NULL, 0, true);
++	uint8_t b[9];
++	if (len > sizeof(b) - 1) {
++		return EINVAL;
++	}
++	int err = rmi_page((uint8_t)(addr >> 8));
+ 	if (err) {
+ 		return err;
+ 	}
+-	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
+-	return touch_msg(addr, NULL, 0, buf, len, false);
++	b[0] = (uint8_t)addr;
++	memcpy(b + 1, buf, len);
++	return qup_xfer(b, len + 1, NULL, 0);
+ }
+ 
+ static int
+-touch_goodix_ack(void)
++rmi_read_desc(uint16_t addr, struct rmi_desc *d)
+ {
+-	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+-	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
++	uint8_t psize = 0, pres[35], s[160];
++	bzero(d, sizeof(*d));
++	int err = rmi_read(addr, &psize, 1);
++	if (!err && (psize == 0 || psize > sizeof(pres))) {
++		err = EIO;
++	}
++	if (!err) {
++		err = rmi_read((uint16_t)(addr + 1), pres, psize);
++	}
++	if (err) {
++		return err;
++	}
++	unsigned first = 1, ssize = pres[0];
++	if (pres[0] == 0) {
++		if (psize < 3) {
++			return EIO;
++		}
++		first = 3;
++		ssize = pres[1] | (unsigned)pres[2] << 8;
++	}
++	if (ssize == 0 || ssize > sizeof(s)) {
++		return EIO;
++	}
++	err = rmi_read((uint16_t)(addr + 2), s, ssize);
++	if (err) {
++		return err;
++	}
++	unsigned off = 0;
++	for (unsigned i = first; i < psize; ++i) {
++		for (unsigned b = 0; b < 8; ++b) {
++			if (!(pres[i] & (1u << b))) {
++				continue;
++			}
++			if (d->count >= 32 || off >= ssize) {
++				return EIO;
++			}
++			struct rmi_reg *r = &d->regs[d->count++];
++			r->reg = (uint8_t)((i - first) * 8 + b);
++			uint32_t size = s[off++];
++			if (size == 0) {
++				if (off + 2 > ssize) {
++					return EIO;
++				}
++				size = s[off] | (uint32_t)s[off + 1] << 8;
++				off += 2;
++				if (size == 0) {
++					if (off + 4 > ssize) {
++						return EIO;
++					}
++					size = s[off] | (uint32_t)s[off + 1] << 8 |
++					    (uint32_t)s[off + 2] << 16 | (uint32_t)s[off + 3] << 24;
++					off += 4;
++				}
++			}
++			r->size = size;
++			unsigned bit = 0;
++			uint8_t v;
++			do {
++				if (off >= ssize) {
++					return EIO;
++				}
++				v = s[off++];
++				for (unsigned k = 0; k < 7; ++k, ++bit) {
++					if ((v & (1u << k)) && bit < 64) {
++						r->subpackets |= 1ull << bit;
++					}
++				}
++			} while (v & 0x80u);
++		}
++	}
++	return 0;
+ }
+ 
+-/* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+- * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+- * on this 16-bit IC the extra bytes would be register data writes. */
++/* Index of register reg among the present ones (= its address offset), or -1. */
+ static int
+-touch_probe_info(uint16_t reg, uint8_t *buf)
++rmi_desc_index(const struct rmi_desc *d, unsigned reg)
+ {
+-	memset(buf, 0xa5, 32);
+-	int err = touch_read(0x5d, reg, true, buf, 32);
+-	printf("SWEET TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+-	    reg, err, st.irq_last, st.irq_status);
+-	if (!err) {
+-		for (unsigned off = 0; off < 32; off += 16) {
+-			char line[49];
+-			for (unsigned j = 0; j < 16; ++j) {
+-				(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
+-			}
+-			printf("SWEET TOUCH: probe raw %#x: %s\n", reg + off, line);
++	for (unsigned i = 0; i < d->count; ++i) {
++		if (d->regs[i].reg == reg) {
++			return (int)i;
+ 		}
+ 	}
+-	return err;
++	return -1;
+ }
+ 
+ static unsigned
+-touch_be16(const uint8_t *p)
++rmi_popcount(uint64_t v)
++{
++	unsigned n = 0;
++	for (; v; v &= v - 1) {
++		++n;
++	}
++	return n;
++}
++
++static int
++rmi_scan(void)
+ {
+-	return ((unsigned)p[0] << 8) | p[1];
++	bzero(&st.f01, sizeof(st.f01));
++	bzero(&st.f12, sizeof(st.f12));
++	st.irq_count = 0;
++	for (unsigned page = 0; page < 4; ++page) {
++		bool any = false;
++		/* 6-byte entries downwards from 0xe9 (Linux PDT_START/END_SCAN_LOCATION) */
++		for (int a = 0xe9; a >= 0x05; a -= 6) {
++			uint8_t e[6];
++			uint16_t base = (uint16_t)(page << 8);
++			int err = rmi_read((uint16_t)(base | a), e, sizeof(e));
++			if (err) {
++				return err;
++			}
++			if (e[5] == 0 || e[5] == 0xff) {
++				break;
++			}
++			any = true;
++			struct rmi_fn f = {
++				.present = true,
++				.query = (uint16_t)(base | e[0]), .command = (uint16_t)(base | e[1]),
++				.control = (uint16_t)(base | e[2]), .data = (uint16_t)(base | e[3]),
++				.irqs = (uint8_t)(e[4] & 7u), .irq_pos = (uint8_t)st.irq_count,
++			};
++			printf("SWEET TOUCH: F%02x query %#x control %#x data %#x irqs %u at %u\n",
++			    e[5], f.query, f.control, f.data, f.irqs, f.irq_pos);
++			st.irq_count += f.irqs;
++			if (e[5] == 0x01) {
++				st.f01 = f;
++			} else if (e[5] == 0x12) {
++				st.f12 = f;
++			}
++		}
++		if (!any) {
++			break;
++		}
++	}
++	st.irq_regs = (st.irq_count + 7) / 8;
++	return (st.f01.present && st.f12.present && st.irq_regs <= 4) ? 0 : ENODEV;
+ }
+ 
+-static bool
+-touch_checksum(const uint8_t *buf, unsigned len)
++/* F01 device control, F12 interrupt enable and F12 geometry. */
++static int
++rmi_configure(void)
+ {
+-	if (len < 2) {
+-		return false;
++	uint8_t q[21], status = 0, ctrl0 = 0, enable[4] = {0};
++	int err = rmi_read(st.f01.query, q, sizeof(q));
++	if (!err) {
++		char product[11];
++		memcpy(product, q + 11, 10);
++		product[10] = 0;
++		for (unsigned i = 0; i < 10; ++i) {
++			if (product[i] && (product[i] < 0x20 || product[i] > 0x7e)) {
++				product[i] = '?';
++			}
++		}
++		printf("SWEET TOUCH: F01 manufacturer %u product \"%s\" info %02x%02x\n",
++		    q[0], product, q[2], q[3]);
++	}
++	if (!err) {
++		err = rmi_read(st.f01.data, &status, 1);
+ 	}
+-	unsigned sum = 0;
+-	for (unsigned i = 0; i + 2 < len; ++i) {
+-		sum += buf[i];
++	if (!err && (status & 0x40u)) {
++		printf("SWEET TOUCH: IC in bootloader mode (status %#x); no firmware to run\n", status);
++		return ENODEV;
++	}
++	if (!err) {
++		err = rmi_read(st.f01.control, &ctrl0, 1);
+ 	}
+-	return (sum & 0xffffu) == touch_be16(buf + len - 2);
++	if (!err) {
++		ctrl0 = (uint8_t)((ctrl0 & ~3u) | 0x80u);       /* normal operation, configured */
++		err = rmi_write(st.f01.control, &ctrl0, 1);
++	}
++	if (!err) {
++		err = rmi_read((uint16_t)(st.f01.control + 1), enable, st.irq_regs);
++	}
++	if (!err) {
++		unsigned byte = st.f12.irq_pos / 8u;
++		enable[byte] = (uint8_t)(enable[byte] | (1u << (st.f12.irq_pos % 8u)));
++		err = rmi_write((uint16_t)(st.f01.control + 1), enable, st.irq_regs);
++	}
++	if (err) {
++		return err;
++	}
++
++	uint8_t q0 = 0;
++	err = rmi_read(st.f12.query, &q0, 1);
++	if (!err && !(q0 & 1u)) {
++		printf("SWEET TOUCH: F12 without register descriptors (q0 %#x)\n", q0);
++		return ENODEV;
++	}
++	/* Control descriptor at query + 4, data descriptor at query + 7. */
++	st.max_x = TS_PANEL_W - 1;
++	st.max_y = TS_PANEL_H - 1;
++	if (!err && rmi_read_desc((uint16_t)(st.f12.query + 4), &st.desc) == 0) {
++		int i = rmi_desc_index(&st.desc, 8);
++		uint8_t b[32];
++		if (i >= 0 && (st.desc.regs[i].subpackets & 1u) && st.desc.regs[i].size >= 4 &&
++		    rmi_read((uint16_t)(st.f12.control + i), b, MIN(st.desc.regs[i].size, 32u)) == 0) {
++			unsigned mx = b[0] | (unsigned)b[1] << 8, my = b[2] | (unsigned)b[3] << 8;
++			if (mx > 100 && my > 100) {
++				st.max_x = mx;
++				st.max_y = my;
++			}
++		}
++	}
++	if (!err) {
++		err = rmi_read_desc((uint16_t)(st.f12.query + 7), &st.desc);
++	}
++	if (err) {
++		return err;
++	}
++	int d0 = rmi_desc_index(&st.desc, 0), d1 = rmi_desc_index(&st.desc, 1);
++	if (d1 < 0 || st.desc.regs[d1].size < 8) {
++		printf("SWEET TOUCH: F12 has no object data (data1)\n");
++		return ENODEV;
++	}
++	st.data1_off = (uint16_t)(d0 >= 0 ? st.desc.regs[d0].size : 0);
++	st.data1_size = (uint16_t)st.desc.regs[d1].size;
++	st.fingers = MIN(MIN(rmi_popcount(st.desc.regs[d1].subpackets), st.data1_size / 8u), TS_MAX);
++	st.read_len = (uint16_t)(st.data1_off + 8u * st.fingers);
++	printf("SWEET TOUCH: F12 max %ux%u, data1 at +%u, %u bytes, %u objects, read %u\n",
++	    st.max_x, st.max_y, st.data1_off, st.data1_size, st.fingers, st.read_len);
++	return st.fingers ? 0 : ENODEV;
+ }
+ 
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+-	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++	for (unsigned id = 0; id < TS_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+ 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
+@@ -383,251 +635,186 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 	st.active = mask;
+ }
+ 
++/* Read one frame of F12 objects; attn: also read (and clear) F01 status. */
+ static int
+-touch_goodix(void)
++touch_frame(bool attn, bool *reset)
+ {
+-	uint8_t buf[90];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint8_t buf[8 + 8 * TS_MAX];
++	int x[TS_MAX] = {0}, y[TS_MAX] = {0};
+ 	uint32_t mask = 0;
+-	int err = touch_read(0x5d, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
+-	if (err) {
+-		return err;
+-	}
+-	if (!(buf[0] & 0x80u)) {
+-		/* Do not acknowledge firmware/config requests that we cannot service. */
+-		if (buf[0] & 0x40u) {
+-			return ENOTSUP;
+-		}
+-		return 0; /* no new touch frame: retain current contacts */
+-	}
+-	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+-		return EIO; /* header untrusted: no write to the IC */
+-	}
+-	unsigned n = buf[2] & 15u;
+-	if (n > TOUCH_MAX) {
+-		(void)touch_goodix_ack();
+-		return EIO;
+-	}
+-	if (n) {
+-		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+-		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
++	if (attn) {
++		uint8_t f01[5];
++		int err = rmi_read(st.f01.data, f01, 1 + st.irq_regs);
+ 		if (err) {
+ 			return err;
+ 		}
+-		if (!touch_checksum(buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u)) {
+-			(void)touch_goodix_ack();
+-			return EIO;
++		if (f01[0] & 0x80u) {
++			*reset = true;  /* unconfigured: the IC reset itself */
++			return 0;
+ 		}
+ 	}
+-	for (unsigned i = 0; i < n; ++i) {
+-		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
+-		unsigned id = p[0] >> 4;
+-		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+-		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+-		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-	}
+-	err = touch_goodix_ack();
+-	if (!err) {
+-		touch_report(mask, x, y);
++	unsigned len = st.read_len;
++	if (len > sizeof(buf)) {
++		len = sizeof(buf);
+ 	}
+-	return err;
+-}
+-
+-static int
+-touch_focaltech(void)
+-{
+-	uint8_t buf[63];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
++	int err = rmi_read(st.f12.data, buf, len);
+ 	if (err) {
+ 		return err;
+ 	}
+-	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+-		return EIO;
+-	}
+-	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+-		const uint8_t *p = buf + 3u + 6u * i;
+-		unsigned id = p[2] >> 4, event = p[0] >> 6;
+-		if (id >= TOUCH_MAX) {
+-			break; /* vendor's unused-record sentinel */
++	for (unsigned i = 0; i < st.fingers && st.data1_off + 8u * (i + 1) <= len; ++i) {
++		const uint8_t *o = buf + st.data1_off + 8u * i;
++		/* finger, stylus, unclassified, gloved finger; not palms */
++		if (o[0] != 1 && o[0] != 2 && o[0] != 4 && o[0] != 6) {
++			continue;
+ 		}
+-		if (seen & (1u << id)) {
+-			return EIO;
++		int px = (int)(((uint32_t)(o[1] | o[2] << 8) * TS_PANEL_W) / (st.max_x + 1));
++		int py = (int)(((uint32_t)(o[3] | o[4] << 8) * TS_PANEL_H) / (st.max_y + 1));
++		if (st.flip & 4) {
++			int t = px * (TS_PANEL_W - 1) / (TS_PANEL_H - 1);
++			px = py * (TS_PANEL_W - 1) / (TS_PANEL_H - 1);
++			py = t * (TS_PANEL_H - 1) / (TS_PANEL_W - 1);
+ 		}
+-		seen |= 1u << id;
+-		if (event == 1u) {
+-			continue; /* UP record */
++		if (st.flip & 1) {
++			px = TS_PANEL_W - 1 - px;
+ 		}
+-		if (event == 3u) {
+-			return EIO;
+-		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
+-			return EIO;
++		if (st.flip & 2) {
++			py = TS_PANEL_H - 1 - py;
+ 		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-		++active;
+-	}
+-	if (active != n) {
+-		return EIO;
++		x[i] = MAX(0, MIN(px, TS_PANEL_W - 1));
++		y[i] = MAX(0, MIN(py, TS_PANEL_H - 1));
++		mask |= 1u << i;
+ 	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+ }
+ 
+-static bool
+-touch_se_init(void)
++/* Power, reset and identify; 0 when F01 and F12 are configured. */
++static int
++touch_bring_up(void)
+ {
+-	uint32_t fw = touch_rd(st.se, SE_FW);
+-	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+-	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+-	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+-	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+-		return false;
+-	}
+-	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("SWEET TOUCH: SE7 already busy; probes skipped\n");
+-		return false;
++	/* Bus mux to the AP (GPIO 75 high hands it to the SLPI in suspend), IC
++	 * held in reset, attention input with pull-up. */
++	ts_gpio(st.sw, 0, 0, 0, true, false);
++	ts_gpio(ts_pin(TS_RESET), 0, 0, 0, true, false);
++	ts_gpio(ts_pin(TS_ATTN), 0, 3, 0, false, false);
++	ts_gpio(ts_pin(TS_SDA), 3, 0, 3, false, false);
++	ts_gpio(ts_pin(TS_SCL), 3, 0, 3, false, false);
++	if (sweet_rpm_vreg_enable("ldoa", 28, 3300000, 100)) {
++		printf("SWEET TOUCH: LDO28 vote failed; trying anyway\n");
++	}
++	touch_wait(5);
++	/* PMI8998 GPIO 2 as in probe v8: digital output high (LV/MV subtypes:
++	 * MODE_CTL output, DIG_OUT_SRC inverted constant low), drive strength
++	 * low if none, enabled. */
++	uint8_t subtype = 0, out_ctl = 0;
++	if (sweet_spmi_read(2, 0xc105, &subtype) || sweet_spmi_read(2, 0xc145, &out_ctl) ||
++	    sweet_spmi_write(2, 0xc140, subtype >= 0x10 ? 0x01 : 0x11) ||
++	    (subtype >= 0x10 && sweet_spmi_write(2, 0xc144, 0x80)) ||
++	    (!(out_ctl & 3u) && sweet_spmi_write(2, 0xc145, (uint8_t)(out_ctl | 1u))) ||
++	    sweet_spmi_write(2, 0xc146, 0x80)) {
++		printf("SWEET TOUCH: PMI8998 GPIO 2 power switch failed\n");
++	}
++	touch_wait(10);
++	ts_gpio(ts_pin(TS_RESET), 0, 0, 0, true, true);
++	touch_wait(150);
++	st.page = 0xfe;
++
++	uint8_t pdt[6];
++	int err = EIO;
++	for (unsigned attempt = 0; attempt < 12 && err; ++attempt) {
++		if (attempt == 6) {
++			/* LDO6 1.8 V was the touch rail of the older xa boards. */
++			printf("SWEET TOUCH: no answer (%d, i2c %#x); adding LDO6 1.8 V\n",
++			    err, st.i2c_status);
++			(void)sweet_rpm_vreg_enable("ldoa", 6, 1800000, 50);
++			ts_gpio(ts_pin(TS_RESET), 0, 0, 0, true, false);
++			touch_wait(5);
++			ts_gpio(ts_pin(TS_RESET), 0, 0, 0, true, true);
++			touch_wait(150);
++		}
++		err = rmi_read(0x00e9, pdt, sizeof(pdt));
++		if (err) {
++			touch_wait(50);
++		}
+ 	}
+-	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+-	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
+-	touch_wr(st.se, 0x644, 0);
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, 0x648, 0xffffffffu);
+-	touch_wr(st.se, SE_DMA, 0);
+-	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+-	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+-	touch_wr(st.se, 0x24, 0x7f);
+-	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+-	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+-	touch_wr(st.se, 0x254, 0);
+-	touch_wr(st.se, 0x260, SE_PACK0);
+-	touch_wr(st.se, 0x264, SE_PACK1);
+-	touch_wr(st.se, 0x284, SE_PACK0);
+-	touch_wr(st.se, 0x288, SE_PACK1);
+-	touch_wr(st.se, SE_TX_WM, 0);
+-	touch_wr(st.se, 0x810, 0);
+-	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+-	printf("SWEET TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+-	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
+-	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
+-	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x254) != 0) {
+-		printf("SWEET TOUCH: packing readback mismatch; probes skipped\n");
+-		return false;
++	printf("SWEET TOUCH: PDT read %d i2c %#x attn %u: %02x %02x %02x %02x %02x %02x\n",
++	    err, st.i2c_status, ts_rd(ts_pin(TS_ATTN), 4) & 1u,
++	    pdt[0], pdt[1], pdt[2], pdt[3], pdt[4], pdt[5]);
++	if (!err) {
++		err = rmi_scan();
+ 	}
+-	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
+-	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-		printf("SWEET TOUCH: inherited FIFO data; probes skipped\n");
+-		return false;
++	if (!err) {
++		err = rmi_configure();
+ 	}
+-	return true;
++	return err;
+ }
+ 
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+-	unsigned delay_s = 45;
++	unsigned delay_s = 30;
+ 	(void)arg;
+ 	(void)result;
+-	/*
+-	 * Start late (boot-arg sweettouchdelay, seconds): if the bus access
+-	 * below hangs the SoC, the persistent log and the GUI got there first.
+-	 */
++	/* Start late (boot-arg sweettouchdelay, seconds): a hang here then
++	 * happens after the log and the GUI are up. */
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
+-	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+-	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.gpio || !st.se) {
+-		printf("SWEET TOUCH: MMIO mapping failed\n");
+-		goto out;
+-	}
+-	if (!touch_clocks() || !touch_se_init()) {
++	st.gcc = ml_io_map(TS_GCC_PA, TS_GCC_SIZE);
++	st.east = ml_io_map(TS_EAST_PA, TS_EAST_SIZE);
++	st.sw = ml_io_map(TS_SWITCH_PA, 0x1000);
++	st.qup = ml_io_map(TS_QUP_PA, 0x1000);
++	if (!st.gcc || !st.east || !st.sw || !st.qup || sweet_spmi_init()) {
++		printf("SWEET TOUCH: MMIO/SPMI setup failed\n");
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+-	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+-	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
+-	if (power_error) {
+-		printf("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
++	if (!touch_clocks() || !qup_init()) {
+ 		goto out;
+ 	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+-	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+-	touch_gpio(7, 1, 0, 0, false, false);
+-	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	touch_wait(2);
+-	touch_gpio(8, 0, 3, 3, true, true);
+-	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+-	st.probing = true;
+-	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+-	(void)touch_probe_info(0x8240, legacy);
+-	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+-	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+-	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+-	    fe1, fe2, fid1, fid2, st.irq_status);
+-	st.probing = false;
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+-	if (st.dead || goodix == fts) {
+-		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+-		    goodix, fts, st.dead);
++	int err = touch_bring_up();
++	if (err) {
++		printf("SWEET TOUCH: bring-up failed (%d); stopping\n", err);
+ 		goto out;
+ 	}
+-	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
+-	unsigned errors = 0, ticks = 0;
++	printf("SWEET TOUCH: Synaptics RMI4 ready, %u objects, flip %d\n", st.fingers, st.flip);
++	unsigned errors = 0, idle = 0, resets = 0;
++	bool told = false;
+ 	while (!st.dead) {
+-		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
++		bool attn = !(ts_rd(ts_pin(TS_ATTN), 4) & 1u);
++		/* Attention, a contact down, or every ~100 ms in case ATTN is lost. */
++		if (attn || st.active || ++idle >= 12) {
++			bool reset = false;
++			idle = 0;
++			err = touch_frame(attn, &reset);
++			if (!err && st.active && !attn && !told) {
++				told = true;
++				printf("SWEET TOUCH: contact seen without attention; polling\n");
++			}
++			if (reset) {
++				printf("SWEET TOUCH: IC reset, reconfiguring\n");
++				touch_report(0, st.x, st.y);
++				st.page = 0xfe;
++				err = rmi_configure();
++				if (err && ++resets > 5) {
++					st.dead = true;
++				}
++			}
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+-					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++					printf("SWEET TOUCH: frame err=%d i2c %#x\n", err, st.i2c_status);
+ 				}
+ 				if (errors == 10) {
+-					touch_report(0, st.x, st.y); /* release after persistent bad reads */
++					touch_report(0, st.x, st.y);    /* release after bad reads */
++				}
++				if (errors >= 1000) {
++					printf("SWEET TOUCH: too many errors; stopping\n");
++					st.dead = true;
+ 				}
+ 			} else {
+ 				errors = 0;
+ 			}
+ 		}
+-		touch_wait(10);
++		touch_wait(8);
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:
+@@ -645,7 +832,7 @@ sweet_touch_init(void)
+ 	}
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+-	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("sweettouchflip", &st.flip, sizeof(st.flip));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..a5b3c00 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -38,6 +38,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <libkern/crc.h>
+ #include <machine/atomic.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -49,6 +50,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++static void sweet_slot_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -660,6 +662,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_slot_start();
+ 	return 0;
+ }
+ 
+@@ -805,6 +808,233 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++/*
++ * walleye A/B boot slots, so the phone can boot iOS from its boot partition
++ * without a PC. On every boot ABL counts down the retry count in the GPT
++ * entry of boot_<slot> until the OS marks the slot successful, and then falls
++ * back to the other slot (Qualcomm PartitionTableUpdate.h attribute bits:
++ * 48-49 priority, 50 active, 51-53 retry count, 54 successful, 55 unbootable;
++ * Android's bootctrl markBootSuccessful sets bit 54 of boot_<slot>).
++ *
++ * boot-arg sweetslot=0 (default): report the boot_a/boot_b attributes only.
++ * sweetslot=1: once the system has been up sweetslotsecs (default 120), set
++ * bit 54 for the active slot in the PRIMARY GPT. Both CRCs are verified
++ * before and after; the entry array is written before the header, and the
++ * backup GPT is never written, so a bad primary falls back to the untouched
++ * backup. Nothing else on any LUN can be written by this code.
++ */
++#define GPT_ATTR_ACTIVE         (1ULL << 50)
++#define GPT_ATTR_SUCCESSFUL     (1ULL << 54)
++#define GPT_ATTR_UNBOOTABLE     (1ULL << 55)
++#define GPT_MAX_LUN             8u
++
++struct sweet_gpt {
++	uint8_t lun;
++	uint64_t entry_lba;
++	uint32_t nent, esz, hdr_size, entry_blocks;
++	int boot[2];                            /* entry index of boot_a, boot_b */
++	uint64_t attr[2];
++};
++
++static uint8_t sweet_gpt_header[UFS_BLOCK];     /* LBA 1, whole block */
++
++/* Read and verify the primary GPT of lun; entries stay in the bounce buffer. */
++static int
++ufs_gpt_load(uint8_t lun, struct sweet_gpt *g)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint32_t hcrc, ecrc;
++	int error = EIO;
++
++	bzero(g, sizeof(*g));
++	g->lun = lun;
++	g->boot[0] = g->boot[1] = -1;
++	su.lun = lun;
++	for (int i = 0; i < 3 && error; i++) {  /* first command may see a unit attention */
++		error = ufs_read_blocks(1, 1);
++	}
++	if (error) {
++		return error;
++	}
++	memcpy(sweet_gpt_header, b, UFS_BLOCK);
++	memcpy(&g->hdr_size, sweet_gpt_header + 12, 4);
++	memcpy(&hcrc, sweet_gpt_header + 16, 4);
++	memcpy(&g->entry_lba, sweet_gpt_header + 72, 8);
++	memcpy(&g->nent, sweet_gpt_header + 80, 4);
++	memcpy(&g->esz, sweet_gpt_header + 84, 4);
++	memcpy(&ecrc, sweet_gpt_header + 88, 4);
++	if (memcmp(sweet_gpt_header, "EFI PART", 8) != 0 || g->hdr_size < 92 ||
++	    g->hdr_size > 512 || g->esz != 128 || g->nent == 0 ||
++	    g->nent > BOUNCE_SIZE / 128 || g->entry_lba < 2) {
++		return ENXIO;
++	}
++	uint8_t hdr[512];
++	memcpy(hdr, sweet_gpt_header, g->hdr_size);
++	bzero(hdr + 16, 4);
++	if (crc32(0, hdr, g->hdr_size) != hcrc) {
++		printf("SWEET SLOT: LUN %u GPT header CRC mismatch\n", lun);
++		return EINVAL;
++	}
++	g->entry_blocks = (g->nent * g->esz + UFS_BLOCK - 1) / UFS_BLOCK;
++	error = ufs_read_blocks(g->entry_lba, g->entry_blocks);
++	if (error) {
++		return error;
++	}
++	if (crc32(0, b, (size_t)g->nent * g->esz) != ecrc) {
++		printf("SWEET SLOT: LUN %u GPT entries CRC mismatch\n", lun);
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < g->nent; i++) {
++		const uint8_t *e = b + i * g->esz;
++		char name[8];
++		unsigned c;
++		for (c = 0; c < 7; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		int slot = strcmp(name, "boot_a") == 0 ? 0 : strcmp(name, "boot_b") == 0 ? 1 : -1;
++		if (slot >= 0 && e[56 + 2 * 6] == 0 && e[57 + 2 * 6] == 0) {
++			g->boot[slot] = (int)i;
++			memcpy(&g->attr[slot], e + 48, 8);
++		}
++	}
++	return (g->boot[0] >= 0 && g->boot[1] >= 0) ? 0 : ENOENT;
++}
++
++/* Only the verified primary GPT header and entry array of g->lun. */
++static int
++ufs_gpt_write(const struct sweet_gpt *g, uint64_t lba, uint32_t count)
++{
++	if (su.lun != g->lun || !((lba == 1 && count == 1) ||
++	    (lba == g->entry_lba && count == g->entry_blocks))) {
++		printf("SWEET SLOT: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0x08,                     /* WRITE(10), FUA */
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++}
++
++static void
++sweet_slot_report(const struct sweet_gpt *g)
++{
++	for (int s = 0; s < 2; s++) {
++		uint64_t a = g->attr[s];
++		printf("SWEET SLOT: LUN %u boot_%c attr 0x%016llx: priority %llu active %llu "
++		    "retries %llu successful %llu unbootable %llu\n", g->lun, 'a' + s, a,
++		    (a >> 48) & 3, (a >> 50) & 1, (a >> 51) & 7, (a >> 54) & 1, (a >> 55) & 1);
++	}
++}
++
++/* Set bit 54 for the active slot of the verified GPT g (entries in the bounce buffer). */
++static int
++sweet_slot_mark(const struct sweet_gpt *g)
++{
++	int active = -1;
++	for (int s = 0; s < 2; s++) {
++		if ((g->attr[s] & GPT_ATTR_ACTIVE) && !(g->attr[s] & GPT_ATTR_UNBOOTABLE)) {
++			active = active == -1 ? s : -2;
++		}
++	}
++	if (active < 0) {
++		printf("SWEET SLOT: no single active slot; nothing marked\n");
++		return 0;
++	}
++	if (g->attr[active] & GPT_ATTR_SUCCESSFUL) {
++		printf("SWEET SLOT: boot_%c already successful\n", 'a' + active);
++		return 0;
++	}
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t attr = g->attr[active] | GPT_ATTR_SUCCESSFUL;
++	memcpy(b + (uint32_t)g->boot[active] * g->esz + 48, &attr, 8);
++	uint32_t ecrc = crc32(0, b, (size_t)g->nent * g->esz);
++	memcpy(sweet_gpt_header + 88, &ecrc, 4);
++	bzero(sweet_gpt_header + 16, 4);
++	uint32_t hcrc = crc32(0, sweet_gpt_header, g->hdr_size);
++	memcpy(sweet_gpt_header + 16, &hcrc, 4);
++	/* Entries first: a header that does not match them leaves the primary
++	 * invalid and firmware uses the backup GPT. */
++	int error = ufs_gpt_write(g, g->entry_lba, g->entry_blocks);
++	if (!error) {
++		memcpy(b, sweet_gpt_header, UFS_BLOCK);
++		error = ufs_gpt_write(g, 1, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	struct sweet_gpt check;
++	if (!error) {
++		error = ufs_gpt_load(g->lun, &check);
++	}
++	if (!error && !(check.attr[active] & GPT_ATTR_SUCCESSFUL)) {
++		error = EIO;
++	}
++	printf("SWEET SLOT: marking boot_%c successful: %s (%d)\n", 'a' + active,
++	    error ? "FAILED" : "done", error);
++	if (!error) {
++		sweet_slot_report(&check);
++	}
++	return error;
++}
++
++/* Find boot_a/boot_b (all LUNs), optionally mark the active slot successful. */
++static void
++sweet_slot_run(bool mark)
++{
++	struct sweet_gpt g;
++	int error = ENOENT;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	for (uint8_t lun = 0; lun < GPT_MAX_LUN && error; lun++) {
++		error = ufs_gpt_load(lun, &g);
++	}
++	if (error) {
++		printf("SWEET SLOT: no LUN with a valid GPT holding boot_a and boot_b\n");
++	} else {
++		sweet_slot_report(&g);
++		if (mark) {
++			(void)sweet_slot_mark(&g);
++		}
++	}
++	su.lun = 0;
++	lck_mtx_unlock(&sweet_ufs_lock);
++}
++
++static uint32_t sweet_slot_mode, sweet_slot_secs = 120;
++static int sweet_slot_chan;
++
++static void
++sweet_slot_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	sweet_slot_run(false);
++	if (sweet_slot_mode == 1) {
++		(void)tsleep(&sweet_slot_chan, PZERO, "sweetslot", hz * (int)sweet_slot_secs);
++		sweet_slot_run(true);
++	}
++}
++
++static void
++sweet_slot_start(void)
++{
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetslot", &sweet_slot_mode, sizeof(sweet_slot_mode));
++	PE_parse_boot_argn("sweetslotsecs", &sweet_slot_secs, sizeof(sweet_slot_secs));
++	if (sweet_slot_secs < 30 || sweet_slot_secs > 3600) {
++		sweet_slot_secs = 120;
++	}
++	if (kernel_thread_start(sweet_slot_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..8214579 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,8 +1,8 @@
+ /*
+- * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * Built-in iOS battery service. walleye: read-only PMI8998 polling every 30
++ * seconds (Linux qpnp-fg-gen3.c / smb-reg.h): the fuel gauge's own monotonic
++ * SOC, battery voltage, current and temperature, USB input and charger state.
++ * boot-arg sweetbattery=0, or unreadable/implausible data: static 100%, AC.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -31,12 +31,12 @@ private:
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	    bool capable, bool charging, bool full, bool measured, bool currentValid,
++	    int centiCelsius);
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+-	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -97,15 +97,19 @@ SweetBattery::putBool(const char *key, bool value)
+ 	}
+ }
+ 
++#define SWEET_BATTERY_MAH       2700u   /* walleye */
++#define SWEET_PMI_SID           2u
++
+ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++    bool capable, bool charging, bool full, bool measured, bool currentValid,
++    int centiCelsius)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Consistent mAh units; powerd computes C*100/M. */
++	const unsigned capacity = (SWEET_BATTERY_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(SWEET_BATTERY_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,15 +123,15 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", SWEET_BATTERY_MAH);
++	putNumber("DesignCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C. */
++	putNumber("Temperature", (UInt32)centiCelsius);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatterySOCEstimated", false);
++	putBool("SweetBatteryTemperatureEstimated", !measured);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -137,7 +141,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, SWEET_BATTERY_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -153,24 +157,22 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+-		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+-		    percent, mv, external, charging);
++		IOLog("SWEET BATTERY: %s, %u%% %umV %dmA external=%d charging=%d\n",
++		    measured ? "PMI8998 fuel gauge" : "static fallback",
++		    percent, mv, ma, external, charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
+-/* Keep the proven single-byte observer command. Read two matching whole
+- * words to reject most torn ADC samples without writing the QG HOLD bit.
+- * This is a bounded consistency check, not a hardware snapshot guarantee. */
++/* Two matching reads of a 16-bit little-endian register pair (PMI8998). */
+ bool
+ SweetBattery::readWord(unsigned address, uint16_t *value)
+ {
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (sweet_spmi_read(SWEET_PMI_SID, address, &lo) ||
++		    sweet_spmi_read(SWEET_PMI_SID, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -183,67 +185,60 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ 	return false;
+ }
+ 
+-unsigned
+-SweetBattery::estimatePercent(unsigned mv)
+-{
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
+-	if (mv <= volts[0]) {
+-		return soc[0];
+-	}
+-	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
+-		if (mv < volts[i]) {
+-			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
+-			       (volts[i] - volts[i - 1]);
+-		}
+-	}
+-	return 100;
+-}
+-
+ void
+ SweetBattery::poll(void)
+ {
+-	uint8_t type, present, usb, path, charger, error, temperature;
+-	uint16_t rawVoltage;
++	uint8_t rev4, soc, soc_cp, usb, charger, batif;
++	uint16_t rawVoltage, rawCurrent, rawTemp;
++	/* FG_BATT_SOC 0x4000: monotonic SOC and its copy (they must agree);
++	 * FG_BATT_INFO 0x4100: VBATT 0xa0, IBATT 0xa2, BATT_TEMP 0x50;
++	 * BATIF 0x1210 bits 4/5: battery id/therm or terminal missing;
++	 * USBIN 0x1310 bit 4: plugged in; CHGR 0x1006 bits 2:0: charger state. */
+ 	bool valid = fReal &&
+-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !sweet_spmi_read(0, 0x1310, &usb) &&
+-	    !sweet_spmi_read(0, 0x110b, &path) &&
+-	    !sweet_spmi_read(0, 0x1006, &charger) &&
+-	    !sweet_spmi_read(0, 0x1007, &error) &&
+-	    !sweet_spmi_read(0, 0x100d, &temperature);
+-	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
++	    !sweet_spmi_read(SWEET_PMI_SID, 0x0103, &rev4) &&
++	    !sweet_spmi_read(SWEET_PMI_SID, 0x4009, &soc) &&
++	    !sweet_spmi_read(SWEET_PMI_SID, 0x400a, &soc_cp) && soc == soc_cp &&
++	    readWord(0x41a0, &rawVoltage) &&
++	    !sweet_spmi_read(SWEET_PMI_SID, 0x1210, &batif) && !(batif & 0x30u) &&
++	    !sweet_spmi_read(SWEET_PMI_SID, 0x1310, &usb) &&
++	    !sweet_spmi_read(SWEET_PMI_SID, 0x1006, &charger);
++	if (valid && rev4 < 2) {
++		/* PMI8998 v1 returns the voltage bytes swapped (PMI8998_V1_REV_WA). */
++		rawVoltage = (uint16_t)((rawVoltage >> 8) | (rawVoltage << 8));
++	}
++	/* 122.07 uV per bit */
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		publish(100, 4200, 0, true, true, false, true, false, false, 2500);
+ 		return;
+ 	}
++	unsigned percent = (soc * 100u + 127u) / 255u;
+ 	bool external = (usb & 0x10u) != 0;
+-	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+ 	unsigned state = charger & 7u;
+-	bool charging = capable && state >= 1 && state <= 4 &&
+-	    !(error & 2u) && !(temperature & 0x0cu);
+-	/* Inhibit (0) does not by itself establish full capacity. */
+-	bool full = external && state == 5 && !(error & 2u);
++	/* trickle, pre, fast, full-on, taper; 5 terminated; 6 inhibit; 7 disabled */
++	bool charging = external && state <= 4;
++	bool full = external && (state == 5 || percent >= 100);
+ 	int ma = 0;
+-	uint8_t subtype;
+-	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+-	    rawCurrent != 0x8000;
++	bool currentValid = readWord(0x41a2, &rawCurrent);
+ 	if (currentValid) {
++		if (rev4 < 2) {
++			rawCurrent = (uint16_t)((rawCurrent >> 8) | (rawCurrent << 8));
++		}
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+-		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+-		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
++		/* 488.281 uA per bit; FG: positive = discharge; IOPMPowerSource: positive = charge */
++		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	}
++	int centiCelsius = 2500;
++	if (readWord(0x4150, &rawTemp)) {
++		int kelvin = (int)(((rawTemp & 0x7ffu) + 2u) / 4u);
++		if (kelvin > 233 && kelvin < 373) {
++			centiCelsius = (kelvin - 273) * 100;
++		}
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true,
++	    currentValid, centiCelsius);
+ }
+ 
+ void
+@@ -262,7 +257,7 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 1;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 6d7f9d7..470ca19 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -1,7 +1,10 @@
+ /*
+- * A55 SMP bring-up for sweet using XNU's legacy IOCPU interface and PSCI.
++ * SMP bring-up using XNU's legacy IOCPU interface and PSCI (sweet: A55s;
++ * walleye: the four big Kryo 280 cores, the only ones with 16K pages).
+  * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+- * CPU_OFF, suspend and the A76 cores still require separate platform work.
++ * CPU_OFF and suspend still require separate platform work.
++ * walleye: a secondary that does not come up is retried once and then left
++ * off; the system keeps running on the CPUs that did start.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -39,6 +42,20 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+ 	return (int32_t)x0;
+ }
+ 
++/* PSCI AFFINITY_INFO: 0 on, 1 off, 2 on pending, < 0 error. */
++static int32_t
++sweet_psci_affinity_info(uint64_t target)
++{
++	register uint64_t x0 __asm__("x0") = 0xC4000004ULL;
++	register uint64_t x1 __asm__("x1") = target;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
+ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+@@ -150,25 +167,53 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		panic("SWEET CPU: expected boot MPIDR 0x%x as logical CPU 0, ADT has 0x%x as %u",
+ 		    boot_mpidr, topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
+ 	}
++	unsigned int alive = 0;
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		uint32_t mpidr = topology->cpus[i].phys_id;
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+-			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
++			if (i == 0) {
++				panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
++			}
++			IOLog("SWEET CPU: cpu=%u processor_start failed: %d\n", i, kr);
++			break;
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+-		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+-		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+-		    !sweet_cpu_signal_is_enabled(i)) {
+-			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++		bool up = false;
++		for (int attempt = 0; attempt < 2 && !up; attempt++) {
++			nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++			for (;;) {
++				up = __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) != 0 &&
++				    sweet_cpu_signal_is_enabled(i);
++				if (up || mach_absolute_time() > deadline) {
++					break;
++				}
++				IOSleep(1);
++			}
++			if (up || i == 0) {
++				break;
++			}
++			int32_t state = sweet_psci_affinity_info(mpidr);
++			IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s (initCPU=%u, PSCI state %d)\n",
++			    i, mpidr, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE), state);
++			if (attempt == 0 && state == 1 && __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0) {
++				vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++				IOLog("SWEET CPU: cpu=%u retry CPU_ON rc=%d\n", i,
++				    sweet_psci_cpu_on(mpidr, entry, i));
++			} else {
++				break;
++			}
++		}
++		if (!up) {
++			if (i == 0) {
++				panic("SWEET CPU: boot cpu startup timeout (GIC/SGI)");
+ 			}
+-			IOSleep(1);
++			IOLog("SWEET CPU: cpu=%u left off; continuing with %u CPUs\n", i, alive);
++			break;
+ 		}
+-		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+-		    i, topology->cpus[i].phys_id);
++		alive++;
++		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n", i, mpidr);
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -176,7 +221,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+-	    topology->num_cpus, topology->num_cpus);
++	    alive, topology->num_cpus);
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -246,9 +291,11 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+-	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
++	/* cpu_start() discards PE_cpu_start's return: startAll times out on it,
++	 * logs it and carries on without this CPU. */
+ 	if (rc != 0) {
+-		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++		IOLog("SWEET CPU: cpu=%u PSCI CPU_ON failed rc=%d\n", getCPUNumber(), rc);
++		return KERN_FAILURE;
+ 	}
+ 	return KERN_SUCCESS;
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8998973..54b7c1d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -138,6 +138,39 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/* Where the presented display lies on the panel, for touch (SweetHID.cpp). */
++static struct {
++	bool     valid, scaled;
++	int32_t  outX, outY, offX, offY;
++	uint32_t outW, outH, logicalW, logicalH;
++} gSweetFBGeometry;
++
++extern "C" bool sweet_fb_panel_to_unit(int x, int y, int32_t *ux, int32_t *uy,
++    uint32_t *logical_w, uint32_t *logical_h);
++
++/* Panel pixel -> Q16 position (0..0xffff) on the presented display. */
++extern "C" bool
++sweet_fb_panel_to_unit(int x, int y, int32_t *ux, int32_t *uy,
++    uint32_t *logical_w, uint32_t *logical_h)
++{
++	if (!gSweetFBGeometry.valid) {
++		return false;
++	}
++	int64_t nx, ny;
++	if (gSweetFBGeometry.scaled) {
++		nx = ((int64_t)(x - gSweetFBGeometry.outX) << 16) / gSweetFBGeometry.outW;
++		ny = ((int64_t)(y - gSweetFBGeometry.outY) << 16) / gSweetFBGeometry.outH;
++	} else {
++		nx = ((int64_t)(x + gSweetFBGeometry.offX) << 16) / gSweetFBGeometry.logicalW;
++		ny = ((int64_t)(y + gSweetFBGeometry.offY) << 16) / gSweetFBGeometry.logicalH;
++	}
++	*ux = (int32_t)(nx < 0 ? 0 : (nx > 0xffff ? 0xffff : nx));
++	*uy = (int32_t)(ny < 0 ? 0 : (ny > 0xffff ? 0xffff : ny));
++	*logical_w = gSweetFBGeometry.logicalW;
++	*logical_h = gSweetFBGeometry.logicalH;
++	return true;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -231,6 +264,16 @@ AppleCLCD::start(IOService *provider)
+ 	if (fScaled) {
+ 		IOLog("SWEET FB: scaled to %ux%u at %d,%d (letterbox)\n", fOutW, fOutH, fOutX, fOutY);
+ 	}
++	gSweetFBGeometry.scaled = fScaled;
++	gSweetFBGeometry.outX = fOutX;
++	gSweetFBGeometry.outY = fOutY;
++	gSweetFBGeometry.outW = fOutW;
++	gSweetFBGeometry.outH = fOutH;
++	gSweetFBGeometry.offX = fOffX;
++	gSweetFBGeometry.offY = fOffY;
++	gSweetFBGeometry.logicalW = fLogicalW;
++	gSweetFBGeometry.logicalH = fLogicalH;
++	gSweetFBGeometry.valid = !fScaled || (fOutW && fOutH);
+ 	return true;
+ }
+ 
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..fd09915 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -30,6 +30,9 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++/* SweetFramebuffer.cpp: panel pixel -> Q16 unit position on the presented display. */
++extern "C" bool sweet_fb_panel_to_unit(int x, int y, int32_t *ux, int32_t *uy,
++    uint32_t *logical_w, uint32_t *logical_h);
+ 
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -458,22 +461,34 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > 4095 ? 4095 : x);
++	y = y < 0 ? 0 : (y > 4095 ? 4095 : y);
++
++	/* Panel pixels -> the presented 1125x2436 display, through the same
++	 * crop or letterbox the framebuffer uses (SweetFramebuffer.cpp). */
++	int32_t ux, uy;
++	uint32_t lw = (uint32_t)fLogicalW, lh = (uint32_t)fLogicalH;
++	IOFixed nx, ny;
++	if (sweet_fb_panel_to_unit(x, y, &ux, &uy, &lw, &lh)) {
++		nx = ux;
++		ny = uy;
++	} else {
++		nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++		ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	}
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		/* Within SWEET_TOUCH_EDGE_PX logical pixels of a display edge */
++		IOFixed ex = (IOFixed)(((int64_t)SWEET_TOUCH_EDGE_PX << 16) / lw);
++		IOFixed ey = (IOFixed)(((int64_t)SWEET_TOUCH_EDGE_PX << 16) / lh);
++		fEdge[finger] = nx < ex || nx > 0x10000 - ex || ny < ey || ny > 0x10000 - ey;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
