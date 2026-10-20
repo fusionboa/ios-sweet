@@ -1,0 +1,25 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..3185c31 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -141,6 +141,20 @@ pe_init_fiq()
+ 		}
+ 
+ 		gicr_size = gicr_size_prop;
++#if defined(SWEET)
++		/*
++		 * walleye's ABL leaves GICD_CTLR = 0 (sweet's leaves ARE_NS set). With
++		 * affinity routing off the GICR SGI/PPI registers below are not in use
++		 * and the timer and IPI enables are lost; ARE must be on first.
++		 */
++		if (!(gicd_read32(GICD_CTLR) & GICD_CTLR_ARE_NS)) {
++			gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ARE_NS);
++			while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++				;
++			}
++			kprintf("SWEET GIC: enabled affinity routing (GICD_CTLR 0x%x)\n", gicd_read32(GICD_CTLR));
++		}
++#endif
+ 	}
+ 
+ 	// Find the redistributor for this processor
