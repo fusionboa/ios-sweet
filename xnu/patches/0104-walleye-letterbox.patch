@@ -1,0 +1,175 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..8998973 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -104,6 +104,18 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	/*
++	 * walleye: the presented iPhone X canvas (1125x2436) is taller than
++	 * the 1080x1920 panel. Instead of cropping its middle, shrink it to
++	 * fit the height (letterbox, black bars left and right): panel =
++	 * fOutX/Y + logical * fScaleQ16 / 65536. Boot-arg sweetfb_crop=1
++	 * restores sweet's centered crop.
++	 */
++	bool          fScaled;
++	uint32_t      fScaleQ16, fInvQ16;       /* panel px per logical px, inverse */
++	int32_t       fOutX, fOutY;
++	uint32_t      fOutW, fOutH;
++	uint32_t      fColX[1088];              /* per panel column: source x << 8 | weight */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -176,6 +188,19 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	int crop = 0;
++	PE_parse_boot_argn("sweetfb_crop", &crop, sizeof(crop));
++	if (!crop && (fLogicalW > fWidth || fLogicalH > fHeight) && fWidth <= 1088) {
++		uint64_t sw = ((uint64_t)fWidth << 16) / fLogicalW;
++		uint64_t sh = ((uint64_t)fHeight << 16) / fLogicalH;
++		fScaleQ16 = (uint32_t)(sw < sh ? sw : sh);
++		fInvQ16 = (uint32_t)((1ULL << 32) / fScaleQ16);
++		fOutW = (uint32_t)(((uint64_t)fLogicalW * fScaleQ16) >> 16);
++		fOutH = (uint32_t)(((uint64_t)fLogicalH * fScaleQ16) >> 16);
++		fOutX = (int32_t)(fWidth - fOutW) / 2;
++		fOutY = (int32_t)(fHeight - fOutH) / 2;
++		fScaled = true;
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -203,6 +228,9 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	if (fScaled) {
++		IOLog("SWEET FB: scaled to %ux%u at %d,%d (letterbox)\n", fOutW, fOutH, fOutX, fOutY);
++	}
+ 	return true;
+ }
+ 
+@@ -296,6 +324,80 @@ static uint64_t sweet_fb_swap_count;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/* a + (b - a) * w / 256 on all four 8-bit channels of a8r8g8b8 */
++static inline uint32_t
++sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
++{
++	uint32_t rb = ((a & 0x00ff00ffu) * (256 - w) + (b & 0x00ff00ffu) * w) >> 8;
++	uint32_t ag = (((a >> 8) & 0x00ff00ffu) * (256 - w) + ((b >> 8) & 0x00ff00ffu) * w) >> 8;
++	return (rb & 0x00ff00ffu) | ((ag & 0x00ff00ffu) << 8);
++}
++
++/*
++ * Bilinear copy of a layer's logical rect (dx,dy,w,h; source at sx,sy)
++ * into the letterboxed panel area. Samples are clamped to the rect.
++ */
++static void
++sweet_fb_scaled_copy(AppleCLCD *fb, uintptr_t src, uint32_t bpr,
++    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	int32_t px0 = fb->fOutX + (int32_t)(((int64_t)dx * fb->fScaleQ16) >> 16);
++	int32_t px1 = fb->fOutX + (int32_t)((((int64_t)(dx + w) * fb->fScaleQ16) + 0xffff) >> 16);
++	int32_t py0 = fb->fOutY + (int32_t)(((int64_t)dy * fb->fScaleQ16) >> 16);
++	int32_t py1 = fb->fOutY + (int32_t)((((int64_t)(dy + h) * fb->fScaleQ16) + 0xffff) >> 16);
++	if (px0 < fb->fOutX) {
++		px0 = fb->fOutX;
++	}
++	if (py0 < fb->fOutY) {
++		py0 = fb->fOutY;
++	}
++	if (px1 > fb->fOutX + (int32_t)fb->fOutW) {
++		px1 = fb->fOutX + (int32_t)fb->fOutW;
++	}
++	if (py1 > fb->fOutY + (int32_t)fb->fOutH) {
++		py1 = fb->fOutY + (int32_t)fb->fOutH;
++	}
++	if (px0 >= px1 || py0 >= py1) {
++		return;
++	}
++	/* Column table: source x (in the layer) and its 8-bit fraction. */
++	for (int32_t px = px0; px < px1; px++) {
++		int64_t lx = (((int64_t)(px - fb->fOutX) << 16) + 0x8000) * fb->fInvQ16 >> 16;	/* Q16 logical x */
++		lx -= ((int64_t)dx << 16) + 0x8000;
++		if (lx < 0) {
++			lx = 0;
++		}
++		int32_t x = (int32_t)(lx >> 16), f = (int32_t)((lx >> 8) & 0xff);
++		if (x >= w - 1) {
++			x = w - 1;
++			f = 0;
++		}
++		fb->fColX[px] = (uint32_t)(sx + x) << 8 | (uint32_t)f;
++	}
++	for (int32_t py = py0; py < py1; py++) {
++		int64_t ly = (((int64_t)(py - fb->fOutY) << 16) + 0x8000) * fb->fInvQ16 >> 16;
++		ly -= ((int64_t)dy << 16) + 0x8000;
++		if (ly < 0) {
++			ly = 0;
++		}
++		int32_t y = (int32_t)(ly >> 16);
++		uint32_t fy = (uint32_t)((ly >> 8) & 0xff);
++		if (y >= h - 1) {
++			y = h - 1;
++			fy = 0;
++		}
++		const uint32_t *r0 = (const uint32_t *)(src + (uint64_t)(sy + y) * bpr);
++		const uint32_t *r1 = fy ? (const uint32_t *)(src + (uint64_t)(sy + y + 1) * bpr) : r0;
++		uint32_t *out = (uint32_t *)(fb->fPixels + (uint64_t)py * fb->fRowBytes);
++		for (int32_t px = px0; px < px1; px++) {
++			uint32_t c = fb->fColX[px], x = c >> 8, fx = c & 0xff;
++			uint32_t x1 = fx ? x + 1 : x;
++			uint32_t top = sweet_lerp(r0[x], r0[x1], fx);
++			out[px] = fy ? sweet_lerp(top, sweet_lerp(r1[x], r1[x1], fx), fy) : top;
++		}
++	}
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+@@ -324,6 +426,17 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	if (fScaled) {
++		for (uint32_t y = 0; y < fHeight; y++) {
++			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++			for (int32_t x = 0; x < fOutX; x++) {
++				row[x] = 0xff000000u;
++			}
++			for (uint32_t x = (uint32_t)fOutX + fOutW; x < fWidth; x++) {
++				row[x] = 0xff000000u;
++			}
++		}
++	}
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -359,6 +472,22 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScaled) {
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			uint64_t end = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++			    (uint64_t)(sx + w) * 4;
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&
++			    s->elementHeight == 1 && s->memory != NULL && end <= s->memory->getLength()) {
++				sweet_fb_scaled_copy(this, src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
