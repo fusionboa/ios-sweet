@@ -51,6 +51,10 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # walleye: Kryo 280 is ARMv8.0; Apple clang would build the arm64 slice
+          # for apple-m1 (LSE, LDAPR), so pin it to cortex-a73 like the kernel
+          perl -pi -e '$_ .= qq{        echo "OTHER_CFLAGS[arch=arm64] = -mkernel -nostdinc -Wno-packed -mcpu=cortex-a73" >> "\${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"\n} if m{FAKEROOT_DIR\)/usr/local/include\|g. "\$\{SRCROOT\}/xcodeconfig/libfirehose_kernel.xcconfig"}' dxb/build.sh
+          grep -c 'mcpu=cortex-a73' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
