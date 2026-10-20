@@ -260,9 +260,20 @@ static void read_ids(int idx)
 	dsb();
 }
 
+static void probe_gic(void);
+static volatile int big_gic_done;
+
+/* idx 4 = MPIDR 0x100, the core xnu boots on: run the GIC/vtimer test there too. */
 void secondary_main(uint64_t idx)
 {
 	read_ids(idx);
+	if (idx == 4) {
+		logl("gic test on big core", "mpidr", rsr("mpidr_el1"), "sre", rsr("icc_sre_el1"));
+		probe_gic();
+		dsb();
+		big_gic_done = 1;
+		dsb();
+	}
 	smc(PSCI_CPU_OFF, 0, 0, 0);
 }
 
@@ -285,6 +296,9 @@ static void probe_cpus(void)
 			logl("cpu_on", "mpidr", cpu_mpidr[i], "ret", r);
 		for (int t = 0; t < 200 && !cpus[i].done; t++)
 			delay_ms(1);
+		if (i == 4)
+			for (int t = 0; t < 3000 && !big_gic_done; t++)
+				delay_ms(1);
 	}
 	for (int i = 0; i < NR_CPUS; i++) {
 		const volatile struct cpu_ids *c = &cpus[i];
@@ -386,12 +400,12 @@ void shim_main(uint64_t dtb)
 	fb_find();
 	if (fb)
 		fb_clear(0xff000000);
-	logl("probe v3", "dtb", dtb, "el", rsr("currentel") >> 2);
+	logl("probe v4", "dtb", dtb, "el", rsr("currentel") >> 2);
 	logl("psci", "ver", smc(PSCI_VERSION, 0, 0, 0), "smccc", smc(SMCCC_VERSION, 0, 0, 0));
 	logl("psci", "cpu_on_feat", smc(PSCI_FEATURES, PSCI_CPU_ON, 0, 0), "cntfrq", rsr("cntfrq_el0"));
 	logl("sctlr", "val", rsr("sctlr_el1"), "image", (uintptr_t)shim_main);
+	probe_gic();	/* boot cpu0 first: also enables the distributor */
 	probe_cpus();
-	probe_gic();
 	report_mdss();
 	logl("done: hold power to reboot", 0, 0, 0, 0);
 	for (;;)
