@@ -457,7 +457,7 @@ index 470ca19..3bfaa73 100644
  	/* Secondary startup runs at splsched: queue the self-IPI and return.
  	 * startAll waits for its delivery after the startup thread unmasks IRQs.
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 54b7c1d..9336d14 100644
+index 54b7c1d..2fac37f 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -37,6 +37,27 @@
@@ -509,8 +509,8 @@ index 54b7c1d..9336d14 100644
 +		uint32_t width, height, bpr;
 +		int32_t sx, sy, dx, dy, w, h;
 +	} fLastGeom;
-+	uint64_t      fRowHash[SWEET_FB_HASH_ROWS];
-+	uint8_t       fSrcDirty[SWEET_FB_HASH_ROWS];
++	uint64_t     *fRowHash;                 /* SWEET_FB_HASH_ROWS each (IOMallocData: */
++	uint8_t      *fSrcDirty;                /* an OSObject may not exceed 16 KiB) */
 +	/* status readout: counts over the last second */
 +	uint32_t      fPresents, fSwapsSeen, fStatusDrawnGen;
 +	uint64_t      fCopyAbs;
@@ -519,18 +519,20 @@ index 54b7c1d..9336d14 100644
  	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
  	IOMemoryMap  *fMap;
  	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
-@@ -234,6 +272,10 @@ AppleCLCD::start(IOService *provider)
+@@ -234,6 +272,12 @@ AppleCLCD::start(IOService *provider)
  		fOutY = (int32_t)(fHeight - fOutH) / 2;
  		fScaled = true;
  	}
 +	fFullRedraw = true;
-+	int status = 1;
-+	PE_parse_boot_argn("sweetstatus", &status, sizeof(status));
-+	fStatusOn = status != 0;
++	fRowHash = (uint64_t *)IOMallocData(SWEET_FB_HASH_ROWS * sizeof(uint64_t));
++	fSrcDirty = (uint8_t *)IOMallocData(SWEET_FB_HASH_ROWS);
++	int statusArg = 1;
++	PE_parse_boot_argn("sweetstatus", &statusArg, sizeof(statusArg));
++	fStatusOn = statusArg != 0;
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -314,6 +356,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -314,6 +358,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
@@ -542,7 +544,7 @@ index 54b7c1d..9336d14 100644
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -327,9 +374,63 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -327,9 +376,63 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -606,7 +608,7 @@ index 54b7c1d..9336d14 100644
  void
  AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
  {
-@@ -367,6 +468,23 @@ static uint64_t sweet_fb_swap_count;
+@@ -367,6 +470,23 @@ static uint64_t sweet_fb_swap_count;
   * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
   * default 10 Hz).
   */
@@ -630,7 +632,7 @@ index 54b7c1d..9336d14 100644
  /* a + (b - a) * w / 256 on all four 8-bit channels of a8r8g8b8 */
  static inline uint32_t
  sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
-@@ -382,7 +500,8 @@ sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
+@@ -382,7 +502,8 @@ sweet_lerp(uint32_t a, uint32_t b, uint32_t w)
   */
  static void
  sweet_fb_scaled_copy(AppleCLCD *fb, uintptr_t src, uint32_t bpr,
@@ -640,7 +642,7 @@ index 54b7c1d..9336d14 100644
  {
  	int32_t px0 = fb->fOutX + (int32_t)(((int64_t)dx * fb->fScaleQ16) >> 16);
  	int32_t px1 = fb->fOutX + (int32_t)((((int64_t)(dx + w) * fb->fScaleQ16) + 0xffff) >> 16);
-@@ -429,6 +548,10 @@ sweet_fb_scaled_copy(AppleCLCD *fb, uintptr_t src, uint32_t bpr,
+@@ -429,6 +550,10 @@ sweet_fb_scaled_copy(AppleCLCD *fb, uintptr_t src, uint32_t bpr,
  			y = h - 1;
  			fy = 0;
  		}
@@ -651,7 +653,7 @@ index 54b7c1d..9336d14 100644
  		const uint32_t *r0 = (const uint32_t *)(src + (uint64_t)(sy + y) * bpr);
  		const uint32_t *r1 = fy ? (const uint32_t *)(src + (uint64_t)(sy + y + 1) * bpr) : r0;
  		uint32_t *out = (uint32_t *)(fb->fPixels + (uint64_t)py * fb->fRowBytes);
-@@ -447,6 +570,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -447,6 +572,7 @@ AppleCLCD::swap(const uint8_t *rec)
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -659,7 +661,7 @@ index 54b7c1d..9336d14 100644
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
-@@ -469,7 +593,17 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -469,7 +595,17 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -678,7 +680,7 @@ index 54b7c1d..9336d14 100644
  		for (uint32_t y = 0; y < fHeight; y++) {
  			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
  			for (int32_t x = 0; x < fOutX; x++) {
-@@ -479,6 +613,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -479,6 +615,7 @@ AppleCLCD::present(const uint8_t *rec)
  				row[x] = 0xff000000u;
  			}
  		}
@@ -686,22 +688,22 @@ index 54b7c1d..9336d14 100644
  	}
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
-@@ -526,7 +661,30 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -526,7 +663,30 @@ AppleCLCD::present(const uint8_t *rec)
  			    (uint64_t)(sx + w) * 4;
  			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&
  			    s->elementHeight == 1 && s->memory != NULL && end <= s->memory->getLength()) {
 -				sweet_fb_scaled_copy(this, src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
 +				const uint8_t *dirty = NULL;
-+				if (h <= SWEET_FB_HASH_ROWS) {
++				if (h <= SWEET_FB_HASH_ROWS && fRowHash != NULL && fSrcDirty != NULL) {
 +					bool same = !full && fLastGeom.width == s->width &&
 +					    fLastGeom.height == s->height && fLastGeom.bpr == s->bytesPerRow &&
 +					    fLastGeom.sx == sx && fLastGeom.sy == sy && fLastGeom.dx == dx &&
 +					    fLastGeom.dy == dy && fLastGeom.w == w && fLastGeom.h == h;
 +					uintptr_t base = src + s->offset + (uintptr_t)sx * 4;
 +					for (int32_t y = 0; y < h; y++) {
-+						uint64_t hash = sweet_row_hash(base + (uintptr_t)(sy + y) * s->bytesPerRow, w);
-+						fSrcDirty[y] = !same || hash != fRowHash[y];
-+						fRowHash[y] = hash;
++						uint64_t rowHash = sweet_row_hash(base + (uintptr_t)(sy + y) * s->bytesPerRow, w);
++						fSrcDirty[y] = !same || rowHash != fRowHash[y];
++						fRowHash[y] = rowHash;
 +					}
 +					fLastGeom.width = s->width;
 +					fLastGeom.height = s->height;
@@ -718,7 +720,7 @@ index 54b7c1d..9336d14 100644
  			}
  			s->release();
  			continue;
-@@ -571,6 +729,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -571,6 +731,8 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		s->release();
  	}
@@ -727,7 +729,7 @@ index 54b7c1d..9336d14 100644
  }
  
  bool
-@@ -712,6 +872,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -712,6 +874,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  				fFB->fPowerOff = off;
  				fFB->fFadeStep = 0;
  				fFB->fDirty = true;     /* on: redraw the latest frame */
