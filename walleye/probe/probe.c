@@ -380,6 +380,356 @@ static void probe_gic(void)
 	logl("vtimer 300ms", "irqs", irq_count, "other", irq_other);
 }
 
+/* ---- touch: Synaptics RMI4 at 0x20 on BLSP1 QUP5 (I2C, GPIO 87/88) ---- */
+
+#define GCC_BASE		0x00100000UL
+#define GCC_APCS_VOTE		(GCC_BASE + 0x52004)	/* bit 17: blsp1_ahb */
+#define GCC_QUP5_I2C_CBCR	(GCC_BASE + 0x21008)	/* bit 0 enable, bit 31 off */
+#define TLMM_EAST		(0x03400000UL + 0x900000)
+#define TLMM_WEST		(0x03400000UL + 0x100000)
+#define GPIO_CFG(t, n)		((t) + 0x1000UL * (n))
+#define GPIO_IO(t, n)		((t) + 0x1000UL * (n) + 4)
+#define QUP5			0x0c179000UL
+
+#define QUP_CONFIG		0x000
+#define QUP_STATE		0x004
+#define QUP_IO_MODE		0x008
+#define QUP_SW_RESET		0x00c
+#define QUP_OPERATIONAL		0x018
+#define QUP_ERROR_FLAGS		0x01c
+#define QUP_HW_VERSION		0x030
+#define QUP_MX_OUTPUT_CNT	0x100
+#define QUP_OUT_FIFO		0x110
+#define QUP_MX_WRITE_CNT	0x150
+#define QUP_MX_INPUT_CNT	0x200
+#define QUP_MX_READ_CNT		0x208
+#define QUP_IN_FIFO		0x218
+#define QUP_I2C_CLK_CTL		0x400
+#define QUP_I2C_STATUS		0x404
+#define TAG_START		(1 << 8)
+#define TAG_DATA		(2 << 8)
+#define TAG_STOP		(3 << 8)
+#define TAG_REC			(4 << 8)
+#define OP_OUT_NOT_EMPTY	(1u << 4)
+#define OP_IN_NOT_EMPTY		(1u << 5)
+#define I2C_BUS_ACTIVE		(1u << 8)
+#define I2C_ERRORS		0x38000fcu
+static uint8_t TS_ADDR = 0x20;
+
+static int qup_state(uint32_t st)
+{
+	for (int i = 0; i < 1000; i++) {
+		uint32_t v = rd32(QUP5 + QUP_STATE);
+		if ((v & 4) && (v & 3) == st)
+			return 0;
+		if (i == 0)
+			wr32(QUP5 + QUP_STATE, st);
+		delay_ms(0);
+	}
+	return -1;
+}
+
+static uint32_t i2c_err;
+
+/* Wait for the bus to go idle with the output FIFO drained; 0 or I2C_STATUS. */
+static uint32_t qup_wait_idle(void)
+{
+	uint64_t end = now() + rsr("cntfrq_el0") / 50;	/* 20 ms */
+	for (;;) {
+		uint32_t st = rd32(QUP5 + QUP_I2C_STATUS), op = rd32(QUP5 + QUP_OPERATIONAL);
+		if (st & I2C_ERRORS)
+			return st | 0x80000000u;
+		if (!(op & OP_OUT_NOT_EMPTY) && !(st & I2C_BUS_ACTIVE))
+			return 0;
+		if (now() > end)
+			return st | 0x40000000u;
+	}
+}
+
+static int qup_begin(uint32_t wr_cnt, uint32_t rd_cnt)
+{
+	if (qup_state(0))
+		return -1;
+	wr32(QUP5 + QUP_I2C_STATUS, 0xfffffc);	/* clear status */
+	wr32(QUP5 + QUP_OPERATIONAL, 0xff0);
+	wr32(QUP5 + QUP_CONFIG, (2 << 8) | 15 | (rd_cnt ? 0 : (1 << 7)));
+	wr32(QUP5 + QUP_IO_MODE, (1u << 14) | (1u << 15));	/* repack, FIFO mode */
+	wr32(QUP5 + QUP_MX_OUTPUT_CNT, 0);
+	wr32(QUP5 + QUP_MX_WRITE_CNT, wr_cnt);
+	wr32(QUP5 + QUP_MX_INPUT_CNT, 0);
+	wr32(QUP5 + QUP_MX_READ_CNT, rd_cnt);
+	return qup_state(1);
+}
+
+static int i2c_write(const uint8_t *buf, int len)
+{
+	if (qup_begin(len + 1, 0))
+		return -2;
+	uint32_t val = TAG_START | (TS_ADDR << 1);
+	for (int pos = 0, idx = 1; pos < len; pos++, idx++) {
+		uint32_t t = (pos == len - 1 ? TAG_STOP : TAG_DATA) | buf[pos];
+		if (idx & 1)
+			val |= t << 16;
+		else
+			val = t;
+		if ((idx & 1) || pos == len - 1)
+			wr32(QUP5 + QUP_OUT_FIFO, val);
+	}
+	i2c_err = qup_wait_idle();
+	qup_state(0);
+	return i2c_err ? -3 : 0;
+}
+
+static int i2c_read(uint8_t *buf, int len)
+{
+	if (qup_begin(2, len))
+		return -2;
+	wr32(QUP5 + QUP_OUT_FIFO, ((TAG_REC | len) << 16) | TAG_START | (TS_ADDR << 1) | 1);
+	uint64_t end = now() + rsr("cntfrq_el0") / 50;
+	int pos = 0;
+	while (pos < len) {
+		uint32_t st = rd32(QUP5 + QUP_I2C_STATUS);
+		if (st & I2C_ERRORS) {
+			i2c_err = st | 0x80000000u;
+			qup_state(0);
+			return -3;
+		}
+		if (rd32(QUP5 + QUP_OPERATIONAL) & OP_IN_NOT_EMPTY) {
+			uint32_t w = rd32(QUP5 + QUP_IN_FIFO);
+			buf[pos++] = w & 0xff;
+			if (pos < len)
+				buf[pos++] = (w >> 16) & 0xff;
+		} else if (now() > end) {
+			i2c_err = st | 0x40000000u;
+			qup_state(0);
+			return -4;
+		}
+	}
+	i2c_err = 0;
+	qup_state(0);
+	return 0;
+}
+
+/* RMI4 register read: page select, address, then the data (separate transfers). */
+static int rmi_read(uint16_t addr, uint8_t *buf, int len)
+{
+	uint8_t page[2] = { 0xff, (uint8_t)(addr >> 8) };
+	uint8_t a = (uint8_t)addr;
+	int r = i2c_write(page, 2);
+	if (r)
+		return r;
+	r = i2c_write(&a, 1);
+	if (r)
+		return r - 10;
+	return i2c_read(buf, len) - (r ? 0 : 0);
+}
+
+static void gpio_out(uintptr_t tile, unsigned n, int v)
+{
+	wr32(GPIO_IO(tile, n), v ? 2 : 0);
+	wr32(GPIO_CFG(tile, n), (1u << 9) | (0 << 2));	/* OE, gpio function, 2 mA, no pull */
+}
+
+/* ---- SPMI (PMIC arbiter v3) for the touch power switch on PMI8998 GPIO 2 ---- */
+
+#define SPMI_CORE		0x0800f000UL
+#define SPMI_CHNLS		0x08400000UL
+#define SPMI_OBSRVR		0x09400000UL
+#define SPMI_CNFG		0x0800a000UL
+
+static int spmi_apid(uint16_t ppid, uint32_t *owner)
+{
+	for (int apid = 0; apid < 512; apid++) {
+		uint32_t v = rd32(SPMI_CORE + 0x800 + 4 * apid);
+		if (v && ((v >> 8) & 0xfff) == ppid) {
+			*owner = rd32(SPMI_CNFG + 0x700 + 4 * apid) & 7;
+			return apid;
+		}
+	}
+	return -1;
+}
+
+static int spmi_cmd(uintptr_t chan, uint32_t opc, uint16_t addr)
+{
+	wr32(chan + 0x00, (opc << 27) | ((addr & 0xff) << 4));	/* 1 byte */
+	for (int i = 0; i < 100000; i++) {
+		uint32_t st = rd32(chan + 0x08);
+		if (st & 1)
+			return (st & 0xe) ? -(int)st : 0;
+	}
+	return -100;
+}
+
+static int spmi_read(int apid, uint16_t addr, uint8_t *v)
+{
+	uintptr_t chan = SPMI_OBSRVR + 0x8000UL * apid;
+	int r = spmi_cmd(chan, 1, addr);	/* EXT_READL */
+	if (!r)
+		*v = rd32(chan + 0x18) & 0xff;
+	return r;
+}
+
+static int spmi_write(int apid, uint16_t addr, uint8_t v)
+{
+	uintptr_t chan = SPMI_CHNLS + 0x8000UL * apid;
+	wr32(chan + 0x10, v);
+	return spmi_cmd(chan, 0, addr);	/* EXT_WRITEL */
+}
+
+/* PMI8998 (SID 2) GPIO 2 at 0xc100 -> output high: the touch IC's power switch. */
+static void touch_power_on(void)
+{
+	uint32_t owner = 0xff;
+	int apid = spmi_apid(0x2c1, &owner);
+	logl(" spmi", "arb_ver", rd32(SPMI_CORE), "apid", (uint32_t)apid);
+	if (apid < 0)
+		return;
+	uint8_t sub = 0, mode = 0, en = 0, out = 0, src = 0, vin = 0;
+	spmi_read(apid, 0x05, &sub);
+	spmi_read(apid, 0x40, &mode);
+	spmi_read(apid, 0x41, &vin);
+	spmi_read(apid, 0x44, &src);
+	spmi_read(apid, 0x45, &out);
+	int r = spmi_read(apid, 0x46, &en);
+	logl(" pmigpio2", "owner", owner, "read_ret", (uint32_t)r);
+	logl(" pmigpio2", "sub/mode/vin", sub << 16 | mode << 8 | vin, "src/out/en", src << 16 | out << 8 | en);
+	if (sub >= 0x10) {	/* LV/MV: direction in MODE_CTL, level via output invert */
+		spmi_write(apid, 0x40, 1);
+		spmi_write(apid, 0x44, 0x80);
+	} else {
+		spmi_write(apid, 0x40, (1 << 4) | 1);
+	}
+	if (!(out & 3))
+		spmi_write(apid, 0x45, (out & ~3) | 1);	/* drive strength low */
+	r = spmi_write(apid, 0x46, 0x80);
+	spmi_read(apid, 0x40, &mode);
+	spmi_read(apid, 0x44, &src);
+	spmi_read(apid, 0x46, &en);
+	logl(" pmigpio2 on", "write_ret", (uint32_t)r, "mode/src/en", mode << 16 | src << 8 | en);
+}
+
+/* PM8998 (SID 1) LDOn at 0x4000 + (n-1) * 0x100. walleye xd/xe touch: L28 3.3 V. */
+static void ldo_report(unsigned n)
+{
+	uint32_t owner = 0xff;
+	int apid = spmi_apid(0x100 | (0x40 + n - 1), &owner);
+	if (apid < 0) {
+		logl(" ldo", "n", n, "no apid", 0);
+		return;
+	}
+	uint8_t st = 0, en = 0, v0 = 0, v1 = 0;
+	spmi_read(apid, 0x08, &st);
+	spmi_read(apid, 0x46, &en);
+	spmi_read(apid, 0x40, &v0);
+	spmi_read(apid, 0x41, &v1);
+	logl(" ldo", "n/owner", n << 8 | owner, "st/en/mv", st << 24 | en << 16 | v1 << 8 | v0);
+}
+
+static void __attribute__((unused)) touch_vdd_on(void)
+{
+	uint32_t owner = 0xff;
+	int apid = spmi_apid(0x145, &owner);
+	if (apid < 0) {
+		logl(" ldo6", "no apid", 0, 0, 0);
+		return;
+	}
+	uint8_t st = 0, en = 0, v0 = 0, v1 = 0;
+	spmi_read(apid, 0x08, &st);
+	spmi_read(apid, 0x46, &en);
+	spmi_read(apid, 0x40, &v0);
+	spmi_read(apid, 0x41, &v1);
+	logl(" ldo6", "owner/apid", owner << 16 | (uint32_t)apid, "st/en/vset", st << 24 | en << 16 | v1 << 8 | v0);
+	if (!(en & 0x80) && owner == 0) {
+		int r = spmi_write(apid, 0x46, en | 0x80);
+		delay_ms(5);
+		spmi_read(apid, 0x08, &st);
+		spmi_read(apid, 0x46, &en);
+		logl(" ldo6 on", "write_ret", (uint32_t)r, "st/en", st << 8 | en);
+	}
+}
+
+/* Which 7-bit addresses ACK a 1-byte read? */
+static void i2c_scan(void)
+{
+	uint32_t found[4] = { 0 };
+	uint8_t b;
+	uint8_t save = TS_ADDR;
+	for (int a = 0x08; a < 0x78; a++) {
+		TS_ADDR = (uint8_t)a;
+		if (!i2c_read(&b, 1))
+			found[a >> 5] |= 1u << (a & 31);
+	}
+	TS_ADDR = save;
+	logl(" i2c scan", "08-3f", (uint64_t)found[1] << 32 | found[0], "40-7f", (uint64_t)found[3] << 32 | found[2]);
+}
+
+static void probe_touch(void)
+{
+	logl("touch", "gcc_vote", rd32(GCC_APCS_VOTE), "qup5_cbcr", rd32(GCC_QUP5_I2C_CBCR));
+	wr32(GCC_APCS_VOTE, rd32(GCC_APCS_VOTE) | (1u << 17));
+	wr32(GCC_QUP5_I2C_CBCR, rd32(GCC_QUP5_I2C_CBCR) | 1);
+	for (int i = 0; i < 1000 && (rd32(GCC_QUP5_I2C_CBCR) & (1u << 31)); i++)
+		;
+	logl(" clk", "qup5_cbcr", rd32(GCC_QUP5_I2C_CBCR), 0, 0);
+	if (rd32(GCC_QUP5_I2C_CBCR) & (1u << 31))
+		return;
+
+	logl(" gpio", "87cfg", rd32(GPIO_CFG(TLMM_EAST, 87)), "88cfg", rd32(GPIO_CFG(TLMM_EAST, 88)));
+	logl(" gpio", "89cfg", rd32(GPIO_CFG(TLMM_EAST, 89)), "89io", rd32(GPIO_IO(TLMM_EAST, 89)));
+	logl(" gpio", "75cfg", rd32(GPIO_CFG(TLMM_WEST, 75)), "75io", rd32(GPIO_IO(TLMM_WEST, 75)));
+	logl(" gpio", "125cfg", rd32(GPIO_CFG(TLMM_EAST, 125)), "125io", rd32(GPIO_IO(TLMM_EAST, 125)));
+	wr32(GPIO_CFG(TLMM_EAST, 87), 3 << 2);	/* blsp_i2c5, 2 mA, bias disable */
+	wr32(GPIO_CFG(TLMM_EAST, 88), 3 << 2);
+
+	logl(" qup", "hw_ver", rd32(QUP5 + QUP_HW_VERSION), "state", rd32(QUP5 + QUP_STATE));
+	wr32(QUP5 + QUP_SW_RESET, 1);
+	delay_ms(1);
+	if (qup_state(0)) {
+		logl(" qup", "reset state stuck", rd32(QUP5 + QUP_STATE), 0, 0);
+		return;
+	}
+	/* 19.2 MHz source: fs_div = (19.2M / 100k) / 2 - 3, hs_div 3 */
+	wr32(QUP5 + QUP_I2C_CLK_CTL, (3u << 8) | 93);
+
+	/* Power-up as in the Pixel 2's synaptics_dsx_htc driver: switch GPIO 75
+	 * low (bus to the AP), power GPIO high, reset pulse on GPIO 89, 20 ms. */
+	gpio_out(TLMM_WEST, 75, 0);
+	gpio_out(TLMM_EAST, 89, 0);
+	ldo_report(28);
+	ldo_report(6);
+	touch_power_on();
+	delay_ms(10);
+	gpio_out(TLMM_EAST, 89, 1);
+	delay_ms(100);
+	uint8_t pdt[6] = { 0 };
+	int r = rmi_read(0x00e9, pdt, 6);
+	logl(" rmi pdt", "ret", (uint32_t)r, "i2c_status", i2c_err);
+	if (r) {
+		delay_ms(300);
+		r = rmi_read(0x00e9, pdt, 6);
+		logl(" +300ms", "ret", (uint32_t)r, "i2c_status", i2c_err);
+	}
+	logl(" attn", "125io", rd32(GPIO_IO(TLMM_EAST, 125)), "89io", rd32(GPIO_IO(TLMM_EAST, 89)));
+	i2c_scan();
+	if (r) {	/* maybe the bus switch is the other way round */
+		gpio_out(TLMM_WEST, 75, 1);
+		delay_ms(10);
+		r = rmi_read(0x00e9, pdt, 6);
+		logl(" sw75=1", "ret", (uint32_t)r, "i2c_status", i2c_err);
+		i2c_scan();
+	}
+	if (!r) {
+		logl(" pdt e9", "lo", pdt[0] | pdt[1] << 8 | pdt[2] << 16 | (uint32_t)pdt[3] << 24,
+		    "hi", pdt[4] | pdt[5] << 8);
+		/* Walk the page-0 PDT: 6-byte entries downwards from 0xe9 */
+		for (uint16_t a = 0xe9; a >= 0x0a; a -= 6) {
+			if (rmi_read(a, pdt, 6) || pdt[5] == 0)
+				break;
+			logl(" fn", "id", pdt[5], "q/c/c/d", pdt[0] | pdt[1] << 8 | pdt[2] << 16 | (uint32_t)pdt[3] << 24);
+		}
+	}
+}
+
 static void report_mdss(void)
 {
 	logl("mdss", "hw_rev", rd32(MDSS_BASE), "pipe", fb_pipe);
@@ -400,13 +750,13 @@ void shim_main(uint64_t dtb)
 	fb_find();
 	if (fb)
 		fb_clear(0xff000000);
-	logl("probe v4", "dtb", dtb, "el", rsr("currentel") >> 2);
+	logl("probe v8", "dtb", dtb, "el", rsr("currentel") >> 2);
 	logl("psci", "ver", smc(PSCI_VERSION, 0, 0, 0), "smccc", smc(SMCCC_VERSION, 0, 0, 0));
 	logl("psci", "cpu_on_feat", smc(PSCI_FEATURES, PSCI_CPU_ON, 0, 0), "cntfrq", rsr("cntfrq_el0"));
 	logl("sctlr", "val", rsr("sctlr_el1"), "image", (uintptr_t)shim_main);
-	probe_gic();	/* boot cpu0 first: also enables the distributor */
-	probe_cpus();
+	/* v5: CPU and GIC results are known (v3/v4); keep the screen for touch. */
 	report_mdss();
+	probe_touch();
 	logl("done: hold power to reboot", 0, 0, 0, 0);
 	for (;;)
 		__asm__ volatile("wfe");
