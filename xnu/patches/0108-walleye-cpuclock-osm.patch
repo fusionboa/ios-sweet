@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 72c0f11..240aaef 100644
+index 72c0f11..6509ad0 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -24,6 +24,7 @@
@@ -24,10 +24,11 @@ index 72c0f11..240aaef 100644
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
  static uint32_t sweet_cpus_registered;
-@@ -246,20 +254,14 @@ sweet_cpufreq_run(void)
+@@ -245,21 +253,14 @@ sweet_cpufreq_run(void)
+ 	char text[8];
  	snprintf(text, sizeof(text), "O%u C%u", (unsigned)osm_on, (unsigned)cprh_on);
  	sweet_status_set(8, text);
- 	if (target == 0 || !osm_on || !cprh_on || entries < 2 || !ordered || best == 0 || best == desired) {
+-	if (target == 0 || !osm_on || !cprh_on || entries < 2 || !ordered || best == 0 || best == desired) {
 -		IOLog("SWEET CPUFREQ: no request (target %u, osm %u, cprh %u, %u levels%s, best %u)\n",
 -		    target, (unsigned)osm_on, (unsigned)cprh_on, entries, ordered ? "" : " unordered", best);
 -		return 0;
@@ -53,7 +54,7 @@ index 72c0f11..240aaef 100644
  }
  
  class SweetCPU : public IOCPU {
-@@ -434,7 +436,8 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -434,7 +435,8 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	sweet_status_set(0, text);
  	snprintf(text, sizeof(text), "%uM", sweet_cpu_mhz[0]);
  	sweet_status_set(1, text);
@@ -65,10 +66,10 @@ index 72c0f11..240aaef 100644
  		sweet_status_set(1, text);
 diff --git a/iokit/Kernel/arm/SweetCPUClock.cpp b/iokit/Kernel/arm/SweetCPUClock.cpp
 new file mode 100644
-index 0000000..1522b87
+index 0000000..ec52068
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetCPUClock.cpp
-@@ -0,0 +1,489 @@
+@@ -0,0 +1,496 @@
 +/*
 + * walleye CPU clock: the performance cluster's Operating State Manager (OSM).
 + *
@@ -103,6 +104,7 @@ index 0000000..1522b87
 +
 +#include <IOKit/IOLib.h>
 +#include <arm64/proc_reg.h>
++#include <machine/atomic.h>          /* DSB_SY */
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <stdint.h>
@@ -477,7 +479,13 @@ index 0000000..1522b87
 +	 * for rows above the level the hardware is executing right now - never
 +	 * under the running state machine's feet.
 +	 */
-+	unsigned first = osm_on ? (pstate & 0x3f) + 1 : 0;
++	unsigned cur = pstate & 0x3f;
++	if (cur >= OSM_TABLE_SIZE) {
++		/* Unreadable or unexpected state: assume the safe source. */
++		IOLog("SWEET CPUCLK: pstate %#x is not a LUT slot; assuming level 0\n", pstate);
++		cur = 0;
++	}
++	unsigned first = osm_on ? cur + 1 : 0;
 +	unsigned bad = sclk_program(osm, lut, first);
 +	if (bad) {
 +		IOLog("SWEET CPUCLK: %u LUT rows did not read back; not enabling the OSM\n", bad);
