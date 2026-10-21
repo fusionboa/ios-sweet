@@ -66,10 +66,10 @@ index 72c0f11..6509ad0 100644
  		sweet_status_set(1, text);
 diff --git a/iokit/Kernel/arm/SweetCPUClock.cpp b/iokit/Kernel/arm/SweetCPUClock.cpp
 new file mode 100644
-index 0000000..ec52068
+index 0000000..6e2df65
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetCPUClock.cpp
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,589 @@
 +/*
 + * walleye CPU clock: the performance cluster's Operating State Manager (OSM).
 + *
@@ -129,6 +129,17 @@ index 0000000..ec52068
 +#define CPR_CTL                 0x4             /* bit 0: loop enabled */
 +#define CPRH_CTL                0x3AA0          /* bit 0: OSM interface up */
 +#define CPRH_STATUS             0x3AA4
++
++/* cpr3-regulator.c register map, read-only diagnostic below. */
++#define CPR_STATUS              0x8
++#define CPR_TIMER_AUTO_CONT     0xC
++#define CPR_STEP_QUOT           0x14
++#define CPR_HW_CLOSED_LOOP      0x3000
++#define CPR_TIMER_MID_CONT      0x3004
++#define CPR_TIMER_UP_DN_CONT    0x3008
++#define CPRH_CORNER_REG(n)      (0x3A00 + 4 * (n))
++#define CPRH_CORNER_BAND        0x3AA8
++#define CPRH_CORNER_COUNT       34
 +
 +#define QFPROM_PA               0x00784000ULL
 +#define PERFCL_EFUSE            (0x00784130 - QFPROM_PA)  /* speed bin: 31:29 */
@@ -345,6 +356,20 @@ index 0000000..ec52068
 +	return *(volatile uint32_t *)(base + off);
 +}
 +
++/* One QFPROM row is 64 bits wide (two 32-bit words). */
++static uint64_t
++sclk_fuse_row(vm_offset_t fuse, unsigned row)
++{
++	return (uint64_t)sclk_rd(fuse, row * 8) |
++	    ((uint64_t)sclk_rd(fuse, row * 8 + 4) << 32);
++}
++
++static uint32_t
++sclk_fuse_bits(vm_offset_t fuse, unsigned row, unsigned lo, unsigned hi)
++{
++	return (uint32_t)((sclk_fuse_row(fuse, row) >> lo) & ((1ULL << (hi - lo + 1)) - 1));
++}
++
 +static inline void
 +sclk_wr(vm_offset_t base, uint32_t off, uint32_t value)
 +{
@@ -413,6 +438,71 @@ index 0000000..ec52068
 +}
 +
 +/*
++ * Read-only CPRh diagnostic (0109).  The perf cluster's controller has never
++ * been started on this port, so before anything can be programmed it has to be
++ * clear whether the block is merely unclocked, programmed-but-halted, or cold.
++ * The corner table answers that: an empty table means ABL never touched it
++ * (it boots on a little core and never needed the big cluster), and then the
++ * fused quotients below are the inputs the table has to be built from.
++ *
++ * Nothing here writes.  Fuse rows 38/69/70/71 are printed raw as well, so the
++ * decoded fields can be re-derived if a bit range below is wrong.
++ */
++static void
++sclk_cpr_dump(vm_offset_t cprh, vm_offset_t fuse)
++{
++	uint32_t ctl = sclk_rd(cprh, CPR_CTL);
++	uint32_t status = sclk_rd(cprh, CPR_STATUS);
++	uint32_t hctl = sclk_rd(cprh, CPRH_CTL);
++	uint32_t hstat = sclk_rd(cprh, CPRH_STATUS);
++
++	IOLog("SWEET CPR: ctl=%#x (loop_en %u) status=%#x (busy %u) auto=%#x step_quot=%#x\n",
++	    ctl, ctl & 1, status, status & 1,
++	    sclk_rd(cprh, CPR_TIMER_AUTO_CONT), sclk_rd(cprh, CPR_STEP_QUOT));
++	IOLog("SWEET CPR: hw_closed_loop=%#x timer_mid=%#x timer_up_dn=%#x\n",
++	    sclk_rd(cprh, CPR_HW_CLOSED_LOOP), sclk_rd(cprh, CPR_TIMER_MID_CONT),
++	    sclk_rd(cprh, CPR_TIMER_UP_DN_CONT));
++	IOLog("SWEET CPR: CPRH ctl=%#x (osm_en %u) status=%#x corner=%u band=%#x\n",
++	    hctl, hctl & 1, hstat, hstat & 0x3f, sclk_rd(cprh, CPRH_CORNER_BAND));
++
++	unsigned used = 0;
++	for (unsigned i = 0; i < CPRH_CORNER_COUNT; i++) {
++		uint32_t c = sclk_rd(cprh, CPRH_CORNER_REG(i));
++		if (c == 0) {
++			continue;
++		}
++		used++;
++		IOLog("SWEET CPR: corner %2u %#010x init %u floor %u qdelta %u ro %u "
++		    "cl_dis %u temp_dis %u lkv %u\n", i, c, c & 0xff, (c >> 8) & 0xff,
++		    (c >> 16) & 0x1ff, (c >> 25) & 0xf, (c >> 29) & 1, (c >> 30) & 1, (c >> 31) & 1);
++	}
++	IOLog("SWEET CPR: %u of %u corner entries programmed%s\n", used, CPRH_CORNER_COUNT,
++	    used ? "" : " - the controller was never set up");
++
++	/* Perf cluster fuse layout: cprh-kbss-regulator.c, PERFORMANCE_CLUSTER_ID. */
++#define FB(row, lo, hi) sclk_fuse_bits(fuse, (row), (lo), (hi))
++	uint32_t iv[4] = { FB(69, 48, 53), FB(69, 42, 47), FB(69, 36, 41), FB(69, 30, 35) };
++	uint32_t tq[4] = { FB(70, 32, 43), FB(70, 20, 31), FB(70, 8, 19),
++		(FB(69, 60, 63) << 8) | FB(70, 0, 7) };
++	uint32_t qo[4] = { 0, (FB(71, 13, 15) << 4) | FB(71, 21, 24), FB(71, 6, 12),
++		(FB(70, 63, 63) << 6) | FB(71, 0, 5) };
++	uint32_t ro[4] = { FB(69, 26, 29), FB(69, 22, 25), FB(69, 18, 21), FB(69, 14, 17) };
++	IOLog("SWEET CPR: fuses speed_bin %u cpr_rev %u force_highest %u aging_diff %u\n",
++	    FB(38, 29, 31), FB(39, 51, 53), FB(100, 45, 45), FB(71, 25, 32));
++	IOLog("SWEET CPR: fuse corners init_voltage %u %u %u %u (6-bit sign/mag)\n",
++	    iv[0], iv[1], iv[2], iv[3]);
++	IOLog("SWEET CPR: fuse corners target_quot %u %u %u %u\n", tq[0], tq[1], tq[2], tq[3]);
++	IOLog("SWEET CPR: fuse corners quot_offset %u %u %u %u (corner 0 has none)\n",
++	    qo[0], qo[1], qo[2], qo[3]);
++	IOLog("SWEET CPR: fuse corners ro_sel %u %u %u %u\n", ro[0], ro[1], ro[2], ro[3]);
++	IOLog("SWEET CPR: raw rows 38=%#llx 39=%#llx 69=%#llx 70=%#llx 71=%#llx 100=%#llx\n",
++	    (unsigned long long)sclk_fuse_row(fuse, 38), (unsigned long long)sclk_fuse_row(fuse, 39),
++	    (unsigned long long)sclk_fuse_row(fuse, 69), (unsigned long long)sclk_fuse_row(fuse, 70),
++	    (unsigned long long)sclk_fuse_row(fuse, 71), (unsigned long long)sclk_fuse_row(fuse, 100));
++#undef FB
++}
++
++/*
 + * Report the current state, then request the fastest level at or below
 + * sweetcpufreq.  Returns the measured clock afterwards, or 0 if nothing was
 + * requested.
@@ -432,6 +522,9 @@ index 0000000..ec52068
 +		sweet_status_set(8, "O map");
 +		return 0;
 +	}
++
++	/* Read-only: what the voltage controller looks like before we touch it. */
++	sclk_cpr_dump(cprh, fuse);
 +
 +	uint32_t bin = (sclk_rd(fuse, (uint32_t)PERFCL_EFUSE) >> PERFCL_EFUSE_SHIFT) &
 +	    PERFCL_EFUSE_MASK;
