@@ -1,3 +1,47 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index bdb893a..502100f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -986,17 +986,27 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_family = AF_INET;
+ 	to.sin_port = htons(5140);
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++	/*
++	 * Wait until the PC has sent a frame (walleye/usblog.sh pings once its
++	 * address is up): datagrams sent before that are dropped, and with them
++	 * the boot lines. Start anyway after 30 s.
++	 */
++	uint32_t waited = 0;
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+ 		if (!ud.configured) {
+ 			continue;
+ 		}
++		if (ud.rx_frames == 0 && waited++ < 300) {
++			continue;
++		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+ 		}
+ 		uint32_t n;
+-		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
++		uint64_t next = pos;
++		while ((n = sweet_log_copy(&next, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+ 				.msg_name = &to, .msg_namelen = sizeof(to),
+@@ -1004,8 +1014,9 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
++				break;          /* no route/ARP yet: resend this chunk later */
+ 			}
++			pos = next;
+ 		}
+ 	}
+ }
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 index 72c0f11..6509ad0 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
@@ -66,10 +110,10 @@ index 72c0f11..6509ad0 100644
  		sweet_status_set(1, text);
 diff --git a/iokit/Kernel/arm/SweetCPUClock.cpp b/iokit/Kernel/arm/SweetCPUClock.cpp
 new file mode 100644
-index 0000000..6e2df65
+index 0000000..c7b17bf
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetCPUClock.cpp
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,563 @@
 +/*
 + * walleye CPU clock: the performance cluster's Operating State Manager (OSM).
 + *
@@ -130,16 +174,12 @@ index 0000000..6e2df65
 +#define CPRH_CTL                0x3AA0          /* bit 0: OSM interface up */
 +#define CPRH_STATUS             0x3AA4
 +
-+/* cpr3-regulator.c register map, read-only diagnostic below. */
-+#define CPR_STATUS              0x8
-+#define CPR_TIMER_AUTO_CONT     0xC
-+#define CPR_STEP_QUOT           0x14
-+#define CPR_HW_CLOSED_LOOP      0x3000
-+#define CPR_TIMER_MID_CONT      0x3004
-+#define CPR_TIMER_UP_DN_CONT    0x3008
-+#define CPRH_CORNER_REG(n)      (0x3A00 + 4 * (n))
-+#define CPRH_CORNER_BAND        0x3AA8
-+#define CPRH_CORNER_COUNT       34
++/*
++ * 0110: the corner-table sweep (0x3A00 + 4 * n) and the 0x3000 block are gone.
++ * 0109 read those and the phone died after the console output, while 0108 - which
++ * read only the three registers below - booted fine.  Until there is a log from
++ * a boot that survives, this file reads only what has been proven safe.
++ */
 +
 +#define QFPROM_PA               0x00784000ULL
 +#define PERFCL_EFUSE            (0x00784130 - QFPROM_PA)  /* speed bin: 31:29 */
@@ -438,46 +478,24 @@ index 0000000..6e2df65
 +}
 +
 +/*
-+ * Read-only CPRh diagnostic (0109).  The perf cluster's controller has never
-+ * been started on this port, so before anything can be programmed it has to be
-+ * clear whether the block is merely unclocked, programmed-but-halted, or cold.
-+ * The corner table answers that: an empty table means ABL never touched it
-+ * (it boots on a little core and never needed the big cluster), and then the
-+ * fused quotients below are the inputs the table has to be built from.
++ * Read-only CPRh diagnostic.  The perf cluster's controller has never been
++ * started on this port, so the fused quotients below are the inputs its corner
++ * table has to be built from.  QFPROM reads are known good: 0107 read rows
++ * 38/39/69 on a boot that survived.
 + *
-+ * Nothing here writes.  Fuse rows 38/69/70/71 are printed raw as well, so the
-+ * decoded fields can be re-derived if a bit range below is wrong.
++ * Nothing here writes.  Fuse rows are printed raw as well, so the decoded
++ * fields can be re-derived if a bit range below is wrong.
 + */
 +static void
 +sclk_cpr_dump(vm_offset_t cprh, vm_offset_t fuse)
 +{
 +	uint32_t ctl = sclk_rd(cprh, CPR_CTL);
-+	uint32_t status = sclk_rd(cprh, CPR_STATUS);
 +	uint32_t hctl = sclk_rd(cprh, CPRH_CTL);
 +	uint32_t hstat = sclk_rd(cprh, CPRH_STATUS);
 +
-+	IOLog("SWEET CPR: ctl=%#x (loop_en %u) status=%#x (busy %u) auto=%#x step_quot=%#x\n",
-+	    ctl, ctl & 1, status, status & 1,
-+	    sclk_rd(cprh, CPR_TIMER_AUTO_CONT), sclk_rd(cprh, CPR_STEP_QUOT));
-+	IOLog("SWEET CPR: hw_closed_loop=%#x timer_mid=%#x timer_up_dn=%#x\n",
-+	    sclk_rd(cprh, CPR_HW_CLOSED_LOOP), sclk_rd(cprh, CPR_TIMER_MID_CONT),
-+	    sclk_rd(cprh, CPR_TIMER_UP_DN_CONT));
-+	IOLog("SWEET CPR: CPRH ctl=%#x (osm_en %u) status=%#x corner=%u band=%#x\n",
-+	    hctl, hctl & 1, hstat, hstat & 0x3f, sclk_rd(cprh, CPRH_CORNER_BAND));
-+
-+	unsigned used = 0;
-+	for (unsigned i = 0; i < CPRH_CORNER_COUNT; i++) {
-+		uint32_t c = sclk_rd(cprh, CPRH_CORNER_REG(i));
-+		if (c == 0) {
-+			continue;
-+		}
-+		used++;
-+		IOLog("SWEET CPR: corner %2u %#010x init %u floor %u qdelta %u ro %u "
-+		    "cl_dis %u temp_dis %u lkv %u\n", i, c, c & 0xff, (c >> 8) & 0xff,
-+		    (c >> 16) & 0x1ff, (c >> 25) & 0xf, (c >> 29) & 1, (c >> 30) & 1, (c >> 31) & 1);
-+	}
-+	IOLog("SWEET CPR: %u of %u corner entries programmed%s\n", used, CPRH_CORNER_COUNT,
-+	    used ? "" : " - the controller was never set up");
++	/* Only the three reads that 0108 already did and survived. */
++	IOLog("SWEET CPR: ctl=%#x (loop_en %u) cprh_ctl=%#x (osm_en %u) status=%#x (corner %u)\n",
++	    ctl, ctl & 1, hctl, hctl & 1, hstat, hstat & 0x3f);
 +
 +	/* Perf cluster fuse layout: cprh-kbss-regulator.c, PERFORMANCE_CLUSTER_ID. */
 +#define FB(row, lo, hi) sclk_fuse_bits(fuse, (row), (lo), (hi))
