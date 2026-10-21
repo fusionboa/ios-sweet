@@ -1,0 +1,240 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 85498db..bdb893a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -588,7 +588,10 @@ ud_setup(void)
+ 	uint32_t n = 0;
+ 	bool ok = true;
+ 
+-	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	static unsigned setups_logged;
++	if (setups_logged++ < 40) {
++		printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	}
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+ 		ok = (length == 0);
+@@ -976,9 +979,8 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	static char chunk[1400];
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+-	uint64_t pos = sweet_log_position();
+-
+-	pos = pos > 65536 ? pos - 65536 : 0;
++	/* From the start of the 4 MiB ring: the boot lines before USB came up too. */
++	uint64_t pos = 0;
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 3bfaa73..22d2f30 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -85,6 +85,182 @@ sweet_psci_affinity_info(uint64_t target)
+ 	return (int32_t)x0;
+ }
+ 
++/*
++ * walleye CPU clock. ABL leaves the big cluster on its 300 MHz safe source,
++ * which is level 0 of the Operating State Manager (OSM). The OSM owns the
++ * cluster PLL and clock mux and gets each level's voltage from the CPRh
++ * controller, so this code never touches the PLL, the mux or the rail: it
++ * reports their state and, only when the OSM is enabled with a populated
++ * table and CPRh is serving it, asks the OSM for the fastest 4-core level at
++ * or below sweetcpufreq=<MHz> (default 1728, Linux's boot rate; 0 = report).
++ */
++#define CF_OSM_PERF_PA          0x179C2000ULL   /* perf half of the OSM block */
++#define CF_OSM_PWR_PA           0x179C0000ULL
++#define CF_OSM_ENABLE           0x1004
++#define CF_OSM_LUT_FREQ(i)      (0x1154 + 32 * (i))
++#define CF_OSM_LUT_VOLT(i)      (0x1158 + 32 * (i))
++#define CF_OSM_LUT_OVERRIDE(i)  (0x115C + 32 * (i))
++#define CF_OSM_LUT_SPARE(i)     (0x1164 + 32 * (i))
++#define CF_OSM_LUT_SIZE         40
++#define CF_OSM_PSTATE_STATUS    0x1C00          /* WDOG_DOMAIN_PSTATE_STATUS */
++#define CF_OSM_PSTATE_DESIRED   0x1F10
++#define CF_CPRH_PERF_PA         0x179C4000ULL
++#define CF_CPR_CTL              0x4             /* bit 0: loop enabled */
++#define CF_CPRH_CTL             0x3AA0          /* bit 0: OSM interface enabled */
++#define CF_CPRH_STATUS          0x3AA4          /* bits 5:0: current corner */
++#define CF_PERF_PLL_PA          0x17816000ULL
++#define CF_QFPROM_PA            0x00784000ULL
++#define CF_PM8998_SID           1
++#define CF_PM8998_S13           0x3800          /* VDD_APC1, the perf cluster rail */
++
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++static inline uint32_t
++cf_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++/* LUT frequency data: bits 27:24 select the source (0: the 300 MHz safe
++ * source), bits 18:16 the core count, bits 7:0 the PLL L value (19.2 MHz). */
++static uint32_t
++cf_lut_mhz(uint32_t freq_data)
++{
++	if (((freq_data >> 24) & 0xf) == 0) {
++		return 300;
++	}
++	return (freq_data & 0xff) * 192 / 10;
++}
++
++static uint64_t
++cf_fuse_row(vm_offset_t qfprom, unsigned row)
++{
++	uint64_t lo = cf_rd(qfprom, row * 8);
++	uint64_t hi = cf_rd(qfprom, row * 8 + 4);
++	return lo | (hi << 32);
++}
++
++/* Returns the cluster clock in MHz afterwards (0 if it was not measured). */
++static uint32_t
++sweet_cpufreq_run(void)
++{
++	uint32_t target = 1728;
++	PE_parse_boot_argn("sweetcpufreq", &target, sizeof(target));
++
++	vm_offset_t osm = ml_io_map(CF_OSM_PERF_PA, 0x2000);
++	vm_offset_t osm_pwr = ml_io_map(CF_OSM_PWR_PA, 0x2000);
++	vm_offset_t cprh = ml_io_map(CF_CPRH_PERF_PA, 0x4000);
++	vm_offset_t pll = ml_io_map(CF_PERF_PLL_PA, 0x1000);
++	vm_offset_t qfprom = ml_io_map(CF_QFPROM_PA, 0x1000);
++	if (!osm || !osm_pwr || !cprh || !pll || !qfprom) {
++		IOLog("SWEET CPUFREQ: map failed\n");
++		sweet_status_set(8, "O map");
++		return 0;
++	}
++
++	uint32_t enable = cf_rd(osm, CF_OSM_ENABLE);
++	uint32_t desired = cf_rd(osm, CF_OSM_PSTATE_DESIRED);
++	IOLog("SWEET CPUFREQ: perf OSM enable=%#x desired=%u pstate=%#x; pwr OSM enable=%#x desired=%u lut0=%#x\n",
++	    enable, desired, cf_rd(osm, CF_OSM_PSTATE_STATUS), cf_rd(osm_pwr, CF_OSM_ENABLE),
++	    cf_rd(osm_pwr, CF_OSM_PSTATE_DESIRED), cf_rd(osm_pwr, CF_OSM_LUT_FREQ(0)));
++
++	unsigned entries = 0, best = 0;
++	uint32_t best_mhz = 0, last_corner = 0;
++	bool ordered = true;
++	for (unsigned i = 0; i < CF_OSM_LUT_SIZE; i++) {
++		uint32_t freq = cf_rd(osm, CF_OSM_LUT_FREQ(i));
++		uint32_t volt = cf_rd(osm, CF_OSM_LUT_VOLT(i));
++		if (freq == 0 && volt == 0) {
++			continue;
++		}
++		IOLog("SWEET CPUFREQ: lut %2u freq %#010x (%u MHz, %u cores) volt %#010x (vc %u, %u mV) ovr %#x spare %#x\n",
++		    i, freq, cf_lut_mhz(freq), (freq >> 16) & 7, volt, (volt >> 16) & 0x3f, volt & 0xfff,
++		    cf_rd(osm, CF_OSM_LUT_OVERRIDE(i)), cf_rd(osm, CF_OSM_LUT_SPARE(i)));
++		uint32_t corner = (volt >> 16) & 0x3f;
++		if (i == entries) {
++			if (i > 0 && corner < last_corner) {
++				ordered = false;
++			}
++			last_corner = corner;
++			entries++;
++		}
++		uint32_t mhz = cf_lut_mhz(freq);
++		if (i == entries - 1 && ((freq >> 16) & 7) == 4 && mhz <= target && mhz >= best_mhz) {
++			best = i;
++			best_mhz = mhz;
++		}
++	}
++
++	uint32_t cpr_ctl = cf_rd(cprh, CF_CPR_CTL);
++	uint32_t cprh_ctl = cf_rd(cprh, CF_CPRH_CTL);
++	uint32_t cprh_status = cf_rd(cprh, CF_CPRH_STATUS);
++	IOLog("SWEET CPUFREQ: CPRh cpr_ctl=%#x cprh_ctl=%#x status=%#x (corner %u)\n",
++	    cpr_ctl, cprh_ctl, cprh_status, cprh_status & 0x3f);
++	for (unsigned i = 0; i < 32; i++) {
++		uint32_t corner = cf_rd(cprh, 0x3A00 + 4 * i);
++		if (corner) {
++			IOLog("SWEET CPUFREQ: cprh corner %2u %#010x (init %u, floor %u steps)\n",
++			    i, corner, corner & 0xff, (corner >> 8) & 0xff);
++		}
++	}
++	IOLog("SWEET CPUFREQ: perf PLL mode=%#x l=%#x user=%#x config=%#x status=%#x\n",
++	    cf_rd(pll, 0x0), cf_rd(pll, 0x4), cf_rd(pll, 0xC), cf_rd(pll, 0x10), cf_rd(pll, 0x2C));
++
++	/* Fuse rows as cprh-kbss-regulator reads them: speed bin, CPR revision,
++	 * perf open-loop voltages (6-bit sign/magnitude, 10 mV steps). */
++	uint64_t row38 = cf_fuse_row(qfprom, 38), row39 = cf_fuse_row(qfprom, 39);
++	uint64_t row69 = cf_fuse_row(qfprom, 69);
++	static const unsigned ol_shift[4] = { 48, 42, 36, 30 };
++	static const int ol_ref_mv[4] = { 756, 756, 828, 1056 };
++	int ol_mv[4];
++	for (unsigned i = 0; i < 4; i++) {
++		unsigned fuse = (unsigned)(row69 >> ol_shift[i]) & 0x3f;
++		ol_mv[i] = ol_ref_mv[i] + ((fuse & 0x20) ? -1 : 1) * (int)(fuse & 0x1f) * 10;
++	}
++	IOLog("SWEET CPUFREQ: speed bin %u, CPR rev %u, perf open-loop mV %d %d %d %d\n",
++	    (unsigned)(row38 >> 29) & 7, (unsigned)(row39 >> 51) & 7,
++	    ol_mv[0], ol_mv[1], ol_mv[2], ol_mv[3]);
++
++	uint8_t type = 0, subtype = 0, v40 = 0, v41 = 0, mode = 0, en = 0;
++	if (sweet_spmi_init() == 0 &&
++	    !sweet_spmi_read(CF_PM8998_SID, CF_PM8998_S13 + 0x04, &type) &&
++	    !sweet_spmi_read(CF_PM8998_SID, CF_PM8998_S13 + 0x05, &subtype) &&
++	    !sweet_spmi_read(CF_PM8998_SID, CF_PM8998_S13 + 0x40, &v40) &&
++	    !sweet_spmi_read(CF_PM8998_SID, CF_PM8998_S13 + 0x41, &v41) &&
++	    !sweet_spmi_read(CF_PM8998_SID, CF_PM8998_S13 + 0x45, &mode) &&
++	    !sweet_spmi_read(CF_PM8998_SID, CF_PM8998_S13 + 0x46, &en)) {
++		/* FTS426 (subtype 0x0a) holds millivolts; FTS2.5 a range and 5/10 mV steps. */
++		unsigned mv = subtype == 0x0a ? (unsigned)(v40 | (v41 << 8)) :
++		    (v40 ? 160 + 10u * v41 : 80 + 5u * v41);
++		IOLog("SWEET CPUFREQ: S13 type %#x/%#x set %#x %#x (%u mV) mode %#x enable %#x\n",
++		    type, subtype, v40, v41, mv, mode, en);
++	} else {
++		IOLog("SWEET CPUFREQ: S13 not readable over SPMI\n");
++	}
++
++	bool osm_on = (enable & 1) != 0;
++	bool cprh_on = (cpr_ctl & 1) && (cprh_ctl & 1);
++	char text[8];
++	snprintf(text, sizeof(text), "O%u C%u", (unsigned)osm_on, (unsigned)cprh_on);
++	sweet_status_set(8, text);
++	if (target == 0 || !osm_on || !cprh_on || entries < 2 || !ordered || best == 0 || best == desired) {
++		IOLog("SWEET CPUFREQ: no request (target %u, osm %u, cprh %u, %u levels%s, best %u)\n",
++		    target, (unsigned)osm_on, (unsigned)cprh_on, entries, ordered ? "" : " unordered", best);
++		return 0;
++	}
++	IOLog("SWEET CPUFREQ: requesting level %u (%u MHz)\n", best, best_mhz);
++	*(volatile uint32_t *)(osm + CF_OSM_PSTATE_DESIRED) = best;
++	__builtin_arm_dsb(DSB_SY);
++	IOSleep(5);
++	uint32_t mhz = sweet_cpu_measure_mhz();
++	IOLog("SWEET CPUFREQ: now %u MHz (pstate %#x, CPRh corner %u)\n", mhz,
++	    cf_rd(osm, CF_OSM_PSTATE_STATUS), cf_rd(cprh, CF_CPRH_STATUS) & 0x3f);
++	snprintf(text, sizeof(text), "O%u L%u", (unsigned)osm_on, best);
++	sweet_status_set(8, text);
++	return mhz;
++}
++
+ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+@@ -257,6 +433,11 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	sweet_status_set(0, text);
+ 	snprintf(text, sizeof(text), "%uM", sweet_cpu_mhz[0]);
+ 	sweet_status_set(1, text);
++	uint32_t mhz = sweet_cpufreq_run();
++	if (mhz) {
++		snprintf(text, sizeof(text), "%uM", mhz);
++		sweet_status_set(1, text);
++	}
+ 	thread_terminate(current_thread());
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2fac37f..e2bddf7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -44,7 +44,7 @@ extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c, 8x1
+  * characters each) drawn in the left letterbox bar, outside the iOS image.
+  * Drivers set them with sweet_status_set(); boot-arg sweetstatus=0 hides it.
+  */
+-#define SWEET_STATUS_SLOTS      8
++#define SWEET_STATUS_SLOTS      10
+ static char gSweetStatus[SWEET_STATUS_SLOTS][8];
+ static uint32_t gSweetStatusGen;
+ 
