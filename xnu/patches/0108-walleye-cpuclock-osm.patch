@@ -110,10 +110,10 @@ index 72c0f11..6509ad0 100644
  		sweet_status_set(1, text);
 diff --git a/iokit/Kernel/arm/SweetCPUClock.cpp b/iokit/Kernel/arm/SweetCPUClock.cpp
 new file mode 100644
-index 0000000..c7b17bf
+index 0000000..14eeeed
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetCPUClock.cpp
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,636 @@
 +/*
 + * walleye CPU clock: the performance cluster's Operating State Manager (OSM).
 + *
@@ -148,6 +148,7 @@ index 0000000..c7b17bf
 +
 +#include <IOKit/IOLib.h>
 +#include <arm64/proc_reg.h>
++#include <kern/thread.h>
 +#include <machine/atomic.h>          /* DSB_SY */
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
@@ -486,16 +487,62 @@ index 0000000..c7b17bf
 + * Nothing here writes.  Fuse rows are printed raw as well, so the decoded
 + * fields can be re-derived if a bit range below is wrong.
 + */
-+static void
-+sclk_cpr_dump(vm_offset_t cprh, vm_offset_t fuse)
-+{
-+	uint32_t ctl = sclk_rd(cprh, CPR_CTL);
-+	uint32_t hctl = sclk_rd(cprh, CPRH_CTL);
-+	uint32_t hstat = sclk_rd(cprh, CPRH_STATUS);
++#define CPR_STATUS              0x8
++#define CPR_HW_CLOSED_LOOP      0x3000
++#define CPRH_CORNER_REG(n)      (0x3A00 + 4 * (n))
++#define CPRH_CORNER_COUNT       34
 +
-+	/* Only the three reads that 0108 already did and survived. */
-+	IOLog("SWEET CPR: ctl=%#x (loop_en %u) cprh_ctl=%#x (osm_en %u) status=%#x (corner %u)\n",
-+	    ctl, ctl & 1, hctl, hctl & 1, hstat, hstat & 0x3f);
++static void
++sclk_cpr_dump(void)
++{
++	vm_offset_t cprh = ml_io_map(CPRH_PERF_PA, 0x4000);
++	vm_offset_t fuse = ml_io_map(QFPROM_PA, 0x400);
++	if (!cprh || !fuse) {
++		IOLog("SWEET CPR: map failed\n");
++		return;
++	}
++
++	/*
++	 * Every read gets a breadcrumb first. 0109 read this block and the phone
++	 * went down with no panic, so if a read stalls the interconnect the last
++	 * line in the ring names it instead of leaving us guessing again.
++	 */
++	IOLog("SWEET CPR: begin (deferred, ~12s after startAll)\n");
++
++	IOLog("SWEET CPR: probe ctl\n");
++	uint32_t ctl = sclk_rd(cprh, CPR_CTL);
++	IOLog("SWEET CPR: ctl=%#x loop_en=%u\n", ctl, ctl & 1);
++
++	IOLog("SWEET CPR: probe cprh_ctl\n");
++	uint32_t hctl = sclk_rd(cprh, CPRH_CTL);
++	IOLog("SWEET CPR: cprh_ctl=%#x osm_en=%u\n", hctl, hctl & 1);
++
++	IOLog("SWEET CPR: probe cprh_status\n");
++	uint32_t hstat = sclk_rd(cprh, CPRH_STATUS);
++	IOLog("SWEET CPR: cprh_status=%#x corner=%u\n", hstat, hstat & 0x3f);
++
++	IOLog("SWEET CPR: probe cpr_status\n");
++	uint32_t st = sclk_rd(cprh, CPR_STATUS);
++	IOLog("SWEET CPR: cpr_status=%#x busy=%u\n", st, st & 1);
++
++	IOLog("SWEET CPR: probe hw_closed_loop\n");
++	uint32_t hw = sclk_rd(cprh, CPR_HW_CLOSED_LOOP);
++	IOLog("SWEET CPR: hw_closed_loop=%#x\n", hw);
++
++	unsigned used = 0;
++	for (unsigned i = 0; i < CPRH_CORNER_COUNT; i++) {
++		IOLog("SWEET CPR: probe corner %u\n", i);
++		uint32_t c = sclk_rd(cprh, CPRH_CORNER_REG(i));
++		if (c == 0) {
++			continue;
++		}
++		used++;
++		IOLog("SWEET CPR: corner %2u %#010x init %u floor %u qdelta %u ro %u "
++		    "cl_dis %u temp_dis %u lkv %u\n", i, c, c & 0xff, (c >> 8) & 0xff,
++		    (c >> 16) & 0x1ff, (c >> 25) & 0xf, (c >> 29) & 1, (c >> 30) & 1, (c >> 31) & 1);
++	}
++	IOLog("SWEET CPR: corner sweep done, %u of %u entries programmed%s\n", used,
++	    CPRH_CORNER_COUNT, used ? "" : " - controller never set up");
 +
 +	/* Perf cluster fuse layout: cprh-kbss-regulator.c, PERFORMANCE_CLUSTER_ID. */
 +#define FB(row, lo, hi) sclk_fuse_bits(fuse, (row), (lo), (hi))
@@ -520,6 +567,27 @@ index 0000000..c7b17bf
 +#undef FB
 +}
 +
++static void
++sclk_cpr_dump_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	/* Long enough for iOS to be running and the log ring to exist. */
++	IOSleep(12000);
++	sclk_cpr_dump();
++	thread_terminate(current_thread());
++}
++
++static void
++sclk_cpr_dump_start(void)
++{
++	thread_t thr = THREAD_NULL;
++
++	if (kernel_thread_start(sclk_cpr_dump_thread, NULL, &thr) != KERN_SUCCESS) {
++		IOLog("SWEET CPR: could not start the dump thread\n");
++		return;
++	}
++	thread_deallocate(thr);
++}
++
 +/*
 + * Report the current state, then request the fastest level at or below
 + * sweetcpufreq.  Returns the measured clock afterwards, or 0 if nothing was
@@ -541,8 +609,13 @@ index 0000000..c7b17bf
 +		return 0;
 +	}
 +
-+	/* Read-only: what the voltage controller looks like before we touch it. */
-+	sclk_cpr_dump(cprh, fuse);
++	/*
++	 * The dump runs from a deferred thread, not here: this function runs in
++	 * startAll, before the console log ring exists, so anything printed now
++	 * reaches the framebuffer and nothing else (0105, 0107 and 0110 all start
++	 * their USB capture at a SWEET USB event, never at a CPU line).
++	 */
++	sclk_cpr_dump_start();
 +
 +	uint32_t bin = (sclk_rd(fuse, (uint32_t)PERFCL_EFUSE) >> PERFCL_EFUSE_SHIFT) &
 +	    PERFCL_EFUSE_MASK;
