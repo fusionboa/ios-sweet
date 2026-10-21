@@ -27,10 +27,10 @@ index 85498db..bdb893a 100644
  	to.sin_len = sizeof(to);
  	to.sin_family = AF_INET;
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 3bfaa73..22d2f30 100644
+index 3bfaa73..72c0f11 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -85,6 +85,182 @@ sweet_psci_affinity_info(uint64_t target)
+@@ -85,6 +85,183 @@ sweet_psci_affinity_info(uint64_t target)
  	return (int32_t)x0;
  }
  
@@ -62,6 +62,7 @@ index 3bfaa73..22d2f30 100644
 +#define CF_PM8998_SID           1
 +#define CF_PM8998_S13           0x3800          /* VDD_APC1, the perf cluster rail */
 +
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" int sweet_spmi_init(void);
 +extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
 +
@@ -213,7 +214,7 @@ index 3bfaa73..22d2f30 100644
  class SweetCPU : public IOCPU {
  	OSDeclareDefaultStructors(SweetCPU);
  	const OSSymbol *cpuName = NULL;
-@@ -257,6 +433,11 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -257,6 +434,11 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	sweet_status_set(0, text);
  	snprintf(text, sizeof(text), "%uM", sweet_cpu_mhz[0]);
  	sweet_status_set(1, text);
