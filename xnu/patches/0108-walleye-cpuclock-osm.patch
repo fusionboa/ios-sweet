@@ -1,0 +1,572 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 72c0f11..240aaef 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -24,6 +24,7 @@
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ extern "C" void sweet_status_set(unsigned slot, const char *text);  /* SweetFramebuffer.cpp */
++extern "C" uint32_t sweet_cpuclock_up(void);                      /* SweetCPUClock.cpp */
+ 
+ /* Clock of each CPU in MHz, measured in initCPU (cycle counter vs system counter). */
+ static uint32_t sweet_cpu_mhz[SWEET_SMP_MAX_CPUS];
+@@ -53,6 +54,13 @@ sweet_cpu_measure_mhz(void)
+ 	return (uint32_t)((c1 - c0) * freq / (t1 - t0) / 1000000);
+ }
+ 
++/* SweetCPUClock.cpp measures the cluster again after a pstate change. */
++extern "C" uint32_t
++sweet_cpu_clock_mhz(void)
++{
++	return sweet_cpu_measure_mhz();
++}
++
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
+@@ -246,20 +254,14 @@ sweet_cpufreq_run(void)
+ 	snprintf(text, sizeof(text), "O%u C%u", (unsigned)osm_on, (unsigned)cprh_on);
+ 	sweet_status_set(8, text);
+ 	if (target == 0 || !osm_on || !cprh_on || entries < 2 || !ordered || best == 0 || best == desired) {
+-		IOLog("SWEET CPUFREQ: no request (target %u, osm %u, cprh %u, %u levels%s, best %u)\n",
+-		    target, (unsigned)osm_on, (unsigned)cprh_on, entries, ordered ? "" : " unordered", best);
+-		return 0;
+-	}
+-	IOLog("SWEET CPUFREQ: requesting level %u (%u MHz)\n", best, best_mhz);
+-	*(volatile uint32_t *)(osm + CF_OSM_PSTATE_DESIRED) = best;
+-	__builtin_arm_dsb(DSB_SY);
+-	IOSleep(5);
+-	uint32_t mhz = sweet_cpu_measure_mhz();
+-	IOLog("SWEET CPUFREQ: now %u MHz (pstate %#x, CPRh corner %u)\n", mhz,
+-	    cf_rd(osm, CF_OSM_PSTATE_STATUS), cf_rd(cprh, CF_CPRH_STATUS) & 0x3f);
+-	snprintf(text, sizeof(text), "O%u L%u", (unsigned)osm_on, best);
+-	sweet_status_set(8, text);
+-	return mhz;
++	/*
++	 * 0108: diagnostics only now. sweet_cpuclock_up() owns the LUT, the OSM
++	 * enable and the pstate request, so the table that is written and the
++	 * corner it requests always come from the same speed bin.
++	 */
++	IOLog("SWEET CPUFREQ: report only (target %u, osm %u, cprh %u, %u levels%s, best %u)\n",
++	    target, (unsigned)osm_on, (unsigned)cprh_on, entries, ordered ? "" : " unordered", best);
++	return 0;
+ }
+ 
+ class SweetCPU : public IOCPU {
+@@ -434,7 +436,8 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	sweet_status_set(0, text);
+ 	snprintf(text, sizeof(text), "%uM", sweet_cpu_mhz[0]);
+ 	sweet_status_set(1, text);
+-	uint32_t mhz = sweet_cpufreq_run();
++	(void)sweet_cpufreq_run();          /* 0107: OSM, CPRh, PLL and fuse state */
++	uint32_t mhz = sweet_cpuclock_up(); /* 0108: LUT + OSM enable + pstate */
+ 	if (mhz) {
+ 		snprintf(text, sizeof(text), "%uM", mhz);
+ 		sweet_status_set(1, text);
+diff --git a/iokit/Kernel/arm/SweetCPUClock.cpp b/iokit/Kernel/arm/SweetCPUClock.cpp
+new file mode 100644
+index 0000000..1522b87
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetCPUClock.cpp
+@@ -0,0 +1,489 @@
++/*
++ * walleye CPU clock: the performance cluster's Operating State Manager (OSM).
++ *
++ * The Pixel 2 boots with the big cluster on the OSM's 300 MHz safe source: the
++ * OSM is the hardware DCVS unit that owns the cluster PLL and the clock mux,
++ * and nothing has sent it a performance state yet.  Linux brings it up in
++ * drivers/clk/msm/clock-osm.c; this file does the smallest useful subset of
++ * that, with the Pixel 2's own tables.
++ *
++ * There is no software rail write here, on purpose.  A LUT row carries only a
++ * *virtual corner*; the OSM forwards that corner to CPRh, and CPRh is the
++ * hardware voltage controller that commands PM8998 S13 (VDD_APC1) itself from
++ * the chip's fused tables.  Writing S13 over SPMI while CPRh owns it would
++ * fight the closed loop and does not raise the clock either.  Raising the
++ * frequency without a matching corner is how a cluster browns out, so the
++ * corner is part of the same atomic request and CPRh must already be serving
++ * before this driver will ask for anything above the boot level.
++ *
++ * Deliberately absent: any bypass of the droop/limits protection (LMH).  It is
++ * not what is holding the clock at 300 MHz - an unprogrammed OSM is - and
++ * disabling it removes the protection that keeps a fast, low-voltage cluster
++ * from resetting.  If PSTATE_STATUS stays below the request, the log below
++ * says so and that is the thing to investigate.
++ *
++ * XNU has no cpufreq governor to set.  On this SoC "governor = performance"
++ * is exactly this: pin DCVS_PERF_STATE_DESIRED to the top usable level.
++ *
++ * Boot args:
++ *   sweetcpufreq=<MHz>  highest level to request (default 1728, Linux's boot
++ *                       rate).  0 = read-only: report, change nothing.
++ */
++
++#include <IOKit/IOLib.h>
++#include <arm64/proc_reg.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void sweet_status_set(unsigned slot, const char *text);
++extern "C" uint32_t sweet_cpu_clock_mhz(void);   /* SweetCPU.cpp */
++
++/* Register map: drivers/clk/msm/clock-osm.c, msm8998. */
++#define OSM_PERF_PA             0x179C2000ULL
++#define OSM_ENABLE              0x1004
++#define OSM_INDEX(i)            (0x1150 + 32 * (i))
++#define OSM_FREQ(i)             (0x1154 + 32 * (i))
++#define OSM_VOLT(i)             (0x1158 + 32 * (i))
++#define OSM_OVERRIDE(i)         (0x115C + 32 * (i))
++#define OSM_SPARE(i)            (0x1164 + 32 * (i))
++#define OSM_TABLE_SIZE          40              /* hardware LUT slots */
++#define OSM_PSTATE_STATUS       0x1C00
++#define OSM_PSTATE_DESIRED      0x1F10
++
++#define CPRH_PERF_PA            0x179C4000ULL
++#define CPR_CTL                 0x4             /* bit 0: loop enabled */
++#define CPRH_CTL                0x3AA0          /* bit 0: OSM interface up */
++#define CPRH_STATUS             0x3AA4
++
++#define QFPROM_PA               0x00784000ULL
++#define PERFCL_EFUSE            (0x00784130 - QFPROM_PA)  /* speed bin: 31:29 */
++#define PERFCL_EFUSE_SHIFT      29
++#define PERFCL_EFUSE_MASK       7
++#define PERF_SPEED_BINS         4
++
++#define OSM_MV_SHIFT            16              /* VOLT_REG: corner | mV */
++#define OSM_MV_MASK             0xFFF
++
++struct sweet_osm_entry {
++	uint32_t hz;
++	uint32_t freq_data;
++	uint32_t override_data;
++	uint32_t spare_data;
++	uint8_t  corner;        /* zero based virtual corner */
++};
++
++struct sweet_osm_lut {
++	const struct sweet_osm_entry *rows;
++	unsigned n;
++	const uint16_t *mv;     /* voltage ceiling per corner, millivolts */
++	unsigned corners;
++};
++
++
++/* Speed bin 0: 39 DCVS levels, 32 voltage corners. */
++static const struct sweet_osm_entry sweet_perf_lut_0[] = {
++	{  300000000U, 0x0004000fU, 0x01200020U, 0x1U,  0 },   /*  300 MHz, corner  0 */
++	{  345600000U, 0x05040012U, 0x01200020U, 0x1U,  1 },   /*  345 MHz, corner  1 */
++	{  422400000U, 0x05040016U, 0x02200020U, 0x1U,  2 },   /*  422 MHz, corner  2 */
++	{  499200000U, 0x0504001aU, 0x02200020U, 0x1U,  3 },   /*  499 MHz, corner  3 */
++	{  576000000U, 0x0504001eU, 0x02200020U, 0x1U,  4 },   /*  576 MHz, corner  4 */
++	{  652800000U, 0x05040022U, 0x03200020U, 0x1U,  5 },   /*  652 MHz, corner  5 */
++	{  729600000U, 0x05040026U, 0x03200020U, 0x1U,  6 },   /*  729 MHz, corner  6 */
++	{  806400000U, 0x0504002aU, 0x03220022U, 0x1U,  7 },   /*  806 MHz, corner  7 */
++	{  902400000U, 0x0404002fU, 0x04260026U, 0x1U,  8 },   /*  902 MHz, corner  8 */
++	{  979200000U, 0x04040033U, 0x04290029U, 0x1U,  9 },   /*  979 MHz, corner  9 */
++	{ 1056000000U, 0x04040037U, 0x052c002cU, 0x1U, 10 },   /* 1056 MHz, corner 10 */
++	{ 1132800000U, 0x0404003bU, 0x052f002fU, 0x1U, 11 },   /* 1132 MHz, corner 11 */
++	{ 1190400000U, 0x0404003eU, 0x05320032U, 0x2U, 12 },   /* 1190 MHz, corner 12 */
++	{ 1267200000U, 0x04040042U, 0x06350035U, 0x2U, 13 },   /* 1267 MHz, corner 13 */
++	{ 1344000000U, 0x04040046U, 0x06380038U, 0x2U, 14 },   /* 1344 MHz, corner 14 */
++	{ 1420800000U, 0x0404004aU, 0x063b003bU, 0x2U, 15 },   /* 1420 MHz, corner 15 */
++	{ 1497600000U, 0x0404004eU, 0x073e003eU, 0x2U, 16 },   /* 1497 MHz, corner 16 */
++	{ 1574400000U, 0x04040052U, 0x07420042U, 0x2U, 17 },   /* 1574 MHz, corner 17 */
++	{ 1651200000U, 0x04040056U, 0x07450045U, 0x2U, 18 },   /* 1651 MHz, corner 18 */
++	{ 1728000000U, 0x0404005aU, 0x08480048U, 0x2U, 19 },   /* 1728 MHz, corner 19 */
++	{ 1804800000U, 0x0404005eU, 0x084b004bU, 0x2U, 20 },   /* 1804 MHz, corner 20 */
++	{ 1881600000U, 0x04040062U, 0x094e004eU, 0x2U, 21 },   /* 1881 MHz, corner 21 */
++	{ 1958400000U, 0x04040066U, 0x09520052U, 0x2U, 22 },   /* 1958 MHz, corner 22 */
++	{ 2035200000U, 0x0404006aU, 0x09550055U, 0x3U, 23 },   /* 2035 MHz, corner 23 */
++	{ 2112000000U, 0x0404006eU, 0x0a580058U, 0x3U, 24 },   /* 2112 MHz, corner 24 */
++	{ 2208000000U, 0x04040073U, 0x0a5c005cU, 0x3U, 25 },   /* 2208 MHz, corner 25 */
++	{ 2265600000U, 0x04010076U, 0x0a5e005eU, 0x3U, 25 },   /* 2265 MHz, corner 25 */
++	{ 2265600000U, 0x04040076U, 0x0a5e005eU, 0x3U, 26 },   /* 2265 MHz, corner 26 */
++	{ 2342400000U, 0x0401007aU, 0x0a620062U, 0x3U, 26 },   /* 2342 MHz, corner 26 */
++	{ 2342400000U, 0x0404007aU, 0x0a620062U, 0x3U, 27 },   /* 2342 MHz, corner 27 */
++	{ 2419200000U, 0x0401007eU, 0x0a650065U, 0x3U, 27 },   /* 2419 MHz, corner 27 */
++	{ 2419200000U, 0x0404007eU, 0x0a650065U, 0x3U, 28 },   /* 2419 MHz, corner 28 */
++	{ 2496000000U, 0x04010082U, 0x0a680068U, 0x3U, 28 },   /* 2496 MHz, corner 28 */
++	{ 2457600000U, 0x04040080U, 0x0a660066U, 0x3U, 29 },   /* 2457 MHz, corner 29 */
++	{ 2553600000U, 0x04010085U, 0x0a6a006aU, 0x3U, 29 },   /* 2553 MHz, corner 29 */
++	{ 2476800000U, 0x04040081U, 0x0a670067U, 0x3U, 30 },   /* 2476 MHz, corner 30 */
++	{ 2572800000U, 0x04010086U, 0x0a6b006bU, 0x3U, 30 },   /* 2572 MHz, corner 30 */
++	{ 2496000000U, 0x04040082U, 0x0a680068U, 0x3U, 31 },   /* 2496 MHz, corner 31 */
++	{ 2592000000U, 0x04010087U, 0x0a6c006cU, 0x3U, 31 },   /* 2592 MHz, corner 31 */
++};
++static const uint16_t sweet_perf_mv_0[32] = {
++	 828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,
++	 900,  900,  900,  900,  900,  900,  900,  900,  952,  952,  952, 1136,
++	1136, 1136, 1136, 1136, 1136, 1136, 1136, 1136,
++};
++
++/* Speed bin 1: 27 DCVS levels, 26 voltage corners. */
++static const struct sweet_osm_entry sweet_perf_lut_1[] = {
++	{  300000000U, 0x0004000fU, 0x01200020U, 0x1U,  0 },   /*  300 MHz, corner  0 */
++	{  345600000U, 0x05040012U, 0x01200020U, 0x1U,  1 },   /*  345 MHz, corner  1 */
++	{  422400000U, 0x05040016U, 0x02200020U, 0x1U,  2 },   /*  422 MHz, corner  2 */
++	{  499200000U, 0x0504001aU, 0x02200020U, 0x1U,  3 },   /*  499 MHz, corner  3 */
++	{  576000000U, 0x0504001eU, 0x02200020U, 0x1U,  4 },   /*  576 MHz, corner  4 */
++	{  652800000U, 0x05040022U, 0x03200020U, 0x1U,  5 },   /*  652 MHz, corner  5 */
++	{  729600000U, 0x05040026U, 0x03200020U, 0x1U,  6 },   /*  729 MHz, corner  6 */
++	{  806400000U, 0x0504002aU, 0x03220022U, 0x1U,  7 },   /*  806 MHz, corner  7 */
++	{  902400000U, 0x0404002fU, 0x04260026U, 0x1U,  8 },   /*  902 MHz, corner  8 */
++	{  979200000U, 0x04040033U, 0x04290029U, 0x1U,  9 },   /*  979 MHz, corner  9 */
++	{ 1056000000U, 0x04040037U, 0x052c002cU, 0x1U, 10 },   /* 1056 MHz, corner 10 */
++	{ 1132800000U, 0x0404003bU, 0x052f002fU, 0x1U, 11 },   /* 1132 MHz, corner 11 */
++	{ 1190400000U, 0x0404003eU, 0x05320032U, 0x2U, 12 },   /* 1190 MHz, corner 12 */
++	{ 1267200000U, 0x04040042U, 0x06350035U, 0x2U, 13 },   /* 1267 MHz, corner 13 */
++	{ 1344000000U, 0x04040046U, 0x06380038U, 0x2U, 14 },   /* 1344 MHz, corner 14 */
++	{ 1420800000U, 0x0404004aU, 0x063b003bU, 0x2U, 15 },   /* 1420 MHz, corner 15 */
++	{ 1497600000U, 0x0404004eU, 0x073e003eU, 0x2U, 16 },   /* 1497 MHz, corner 16 */
++	{ 1574400000U, 0x04040052U, 0x07420042U, 0x2U, 17 },   /* 1574 MHz, corner 17 */
++	{ 1651200000U, 0x04040056U, 0x07450045U, 0x2U, 18 },   /* 1651 MHz, corner 18 */
++	{ 1728000000U, 0x0404005aU, 0x08480048U, 0x2U, 19 },   /* 1728 MHz, corner 19 */
++	{ 1804800000U, 0x0404005eU, 0x084b004bU, 0x2U, 20 },   /* 1804 MHz, corner 20 */
++	{ 1881600000U, 0x04040062U, 0x094e004eU, 0x2U, 21 },   /* 1881 MHz, corner 21 */
++	{ 1958400000U, 0x04040066U, 0x09520052U, 0x2U, 22 },   /* 1958 MHz, corner 22 */
++	{ 2035200000U, 0x0404006aU, 0x09550055U, 0x3U, 23 },   /* 2035 MHz, corner 23 */
++	{ 2112000000U, 0x0404006eU, 0x0a580058U, 0x3U, 24 },   /* 2112 MHz, corner 24 */
++	{ 2208000000U, 0x04040073U, 0x0a5c005cU, 0x3U, 25 },   /* 2208 MHz, corner 25 */
++	{ 2304000000U, 0x04010078U, 0x0a600060U, 0x3U, 25 },   /* 2304 MHz, corner 25 */
++};
++static const uint16_t sweet_perf_mv_1[26] = {
++	 828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,
++	 900,  900,  900,  900,  900,  900,  900,  900,  952,  952,  952, 1136,
++	1136, 1136,
++};
++
++/* Speed bin 2: 35 DCVS levels, 30 voltage corners. */
++static const struct sweet_osm_entry sweet_perf_lut_2[] = {
++	{  300000000U, 0x0004000fU, 0x01200020U, 0x1U,  0 },   /*  300 MHz, corner  0 */
++	{  345600000U, 0x05040012U, 0x01200020U, 0x1U,  1 },   /*  345 MHz, corner  1 */
++	{  422400000U, 0x05040016U, 0x02200020U, 0x1U,  2 },   /*  422 MHz, corner  2 */
++	{  499200000U, 0x0504001aU, 0x02200020U, 0x1U,  3 },   /*  499 MHz, corner  3 */
++	{  576000000U, 0x0504001eU, 0x02200020U, 0x1U,  4 },   /*  576 MHz, corner  4 */
++	{  652800000U, 0x05040022U, 0x03200020U, 0x1U,  5 },   /*  652 MHz, corner  5 */
++	{  729600000U, 0x05040026U, 0x03200020U, 0x1U,  6 },   /*  729 MHz, corner  6 */
++	{  806400000U, 0x0504002aU, 0x03220022U, 0x1U,  7 },   /*  806 MHz, corner  7 */
++	{  902400000U, 0x0404002fU, 0x04260026U, 0x1U,  8 },   /*  902 MHz, corner  8 */
++	{  979200000U, 0x04040033U, 0x04290029U, 0x1U,  9 },   /*  979 MHz, corner  9 */
++	{ 1056000000U, 0x04040037U, 0x052c002cU, 0x1U, 10 },   /* 1056 MHz, corner 10 */
++	{ 1132800000U, 0x0404003bU, 0x052f002fU, 0x1U, 11 },   /* 1132 MHz, corner 11 */
++	{ 1190400000U, 0x0404003eU, 0x05320032U, 0x2U, 12 },   /* 1190 MHz, corner 12 */
++	{ 1267200000U, 0x04040042U, 0x06350035U, 0x2U, 13 },   /* 1267 MHz, corner 13 */
++	{ 1344000000U, 0x04040046U, 0x06380038U, 0x2U, 14 },   /* 1344 MHz, corner 14 */
++	{ 1420800000U, 0x0404004aU, 0x063b003bU, 0x2U, 15 },   /* 1420 MHz, corner 15 */
++	{ 1497600000U, 0x0404004eU, 0x073e003eU, 0x2U, 16 },   /* 1497 MHz, corner 16 */
++	{ 1574400000U, 0x04040052U, 0x07420042U, 0x2U, 17 },   /* 1574 MHz, corner 17 */
++	{ 1651200000U, 0x04040056U, 0x07450045U, 0x2U, 18 },   /* 1651 MHz, corner 18 */
++	{ 1728000000U, 0x0404005aU, 0x08480048U, 0x2U, 19 },   /* 1728 MHz, corner 19 */
++	{ 1804800000U, 0x0404005eU, 0x084b004bU, 0x2U, 20 },   /* 1804 MHz, corner 20 */
++	{ 1881600000U, 0x04040062U, 0x094e004eU, 0x2U, 21 },   /* 1881 MHz, corner 21 */
++	{ 1958400000U, 0x04040066U, 0x09520052U, 0x2U, 22 },   /* 1958 MHz, corner 22 */
++	{ 2035200000U, 0x0404006aU, 0x09550055U, 0x3U, 23 },   /* 2035 MHz, corner 23 */
++	{ 2112000000U, 0x0404006eU, 0x0a580058U, 0x3U, 24 },   /* 2112 MHz, corner 24 */
++	{ 2208000000U, 0x04040073U, 0x0a5c005cU, 0x3U, 25 },   /* 2208 MHz, corner 25 */
++	{ 2265600000U, 0x04010076U, 0x0a5e005eU, 0x3U, 25 },   /* 2265 MHz, corner 25 */
++	{ 2265600000U, 0x04040076U, 0x0a5e005eU, 0x3U, 26 },   /* 2265 MHz, corner 26 */
++	{ 2342400000U, 0x0401007aU, 0x0a620062U, 0x3U, 26 },   /* 2342 MHz, corner 26 */
++	{ 2323200000U, 0x04040079U, 0x0a610061U, 0x3U, 27 },   /* 2323 MHz, corner 27 */
++	{ 2419200000U, 0x0401007eU, 0x0a650065U, 0x3U, 27 },   /* 2419 MHz, corner 27 */
++	{ 2342400000U, 0x0404007aU, 0x0a620062U, 0x3U, 28 },   /* 2342 MHz, corner 28 */
++	{ 2438400000U, 0x0401007fU, 0x0a660066U, 0x3U, 28 },   /* 2438 MHz, corner 28 */
++	{ 2361600000U, 0x0404007bU, 0x0a620062U, 0x3U, 29 },   /* 2361 MHz, corner 29 */
++	{ 2457600000U, 0x04010080U, 0x0a660066U, 0x3U, 29 },   /* 2457 MHz, corner 29 */
++};
++static const uint16_t sweet_perf_mv_2[30] = {
++	 828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,
++	 900,  900,  900,  900,  900,  900,  900,  900,  952,  952,  952, 1136,
++	1136, 1136, 1136, 1136, 1136, 1136,
++};
++
++/* Speed bin 3: 35 DCVS levels, 31 voltage corners. */
++static const struct sweet_osm_entry sweet_perf_lut_3[] = {
++	{  300000000U, 0x0004000fU, 0x01200020U, 0x1U,  0 },   /*  300 MHz, corner  0 */
++	{  345600000U, 0x05040012U, 0x01200020U, 0x1U,  1 },   /*  345 MHz, corner  1 */
++	{  422400000U, 0x05040016U, 0x02200020U, 0x1U,  2 },   /*  422 MHz, corner  2 */
++	{  499200000U, 0x0504001aU, 0x02200020U, 0x1U,  3 },   /*  499 MHz, corner  3 */
++	{  576000000U, 0x0504001eU, 0x02200020U, 0x1U,  4 },   /*  576 MHz, corner  4 */
++	{  652800000U, 0x05040022U, 0x03200020U, 0x1U,  5 },   /*  652 MHz, corner  5 */
++	{  729600000U, 0x05040026U, 0x03200020U, 0x1U,  6 },   /*  729 MHz, corner  6 */
++	{  806400000U, 0x0504002aU, 0x03220022U, 0x1U,  7 },   /*  806 MHz, corner  7 */
++	{  902400000U, 0x0404002fU, 0x04260026U, 0x1U,  8 },   /*  902 MHz, corner  8 */
++	{  979200000U, 0x04040033U, 0x04290029U, 0x1U,  9 },   /*  979 MHz, corner  9 */
++	{ 1056000000U, 0x04040037U, 0x052c002cU, 0x1U, 10 },   /* 1056 MHz, corner 10 */
++	{ 1132800000U, 0x0404003bU, 0x052f002fU, 0x1U, 11 },   /* 1132 MHz, corner 11 */
++	{ 1190400000U, 0x0404003eU, 0x05320032U, 0x2U, 12 },   /* 1190 MHz, corner 12 */
++	{ 1267200000U, 0x04040042U, 0x06350035U, 0x2U, 13 },   /* 1267 MHz, corner 13 */
++	{ 1344000000U, 0x04040046U, 0x06380038U, 0x2U, 14 },   /* 1344 MHz, corner 14 */
++	{ 1420800000U, 0x0404004aU, 0x063b003bU, 0x2U, 15 },   /* 1420 MHz, corner 15 */
++	{ 1497600000U, 0x0404004eU, 0x073e003eU, 0x2U, 16 },   /* 1497 MHz, corner 16 */
++	{ 1574400000U, 0x04040052U, 0x07420042U, 0x2U, 17 },   /* 1574 MHz, corner 17 */
++	{ 1651200000U, 0x04040056U, 0x07450045U, 0x2U, 18 },   /* 1651 MHz, corner 18 */
++	{ 1728000000U, 0x0404005aU, 0x08480048U, 0x2U, 19 },   /* 1728 MHz, corner 19 */
++	{ 1804800000U, 0x0404005eU, 0x084b004bU, 0x2U, 20 },   /* 1804 MHz, corner 20 */
++	{ 1881600000U, 0x04040062U, 0x094e004eU, 0x2U, 21 },   /* 1881 MHz, corner 21 */
++	{ 1958400000U, 0x04040066U, 0x09520052U, 0x2U, 22 },   /* 1958 MHz, corner 22 */
++	{ 2035200000U, 0x0404006aU, 0x09550055U, 0x3U, 23 },   /* 2035 MHz, corner 23 */
++	{ 2112000000U, 0x0404006eU, 0x0a580058U, 0x3U, 24 },   /* 2112 MHz, corner 24 */
++	{ 2208000000U, 0x04040073U, 0x0a5c005cU, 0x3U, 25 },   /* 2208 MHz, corner 25 */
++	{ 2265600000U, 0x04010076U, 0x0a5e005eU, 0x3U, 25 },   /* 2265 MHz, corner 25 */
++	{ 2265600000U, 0x04040076U, 0x0a5e005eU, 0x3U, 26 },   /* 2265 MHz, corner 26 */
++	{ 2342400000U, 0x0401007aU, 0x0a620062U, 0x3U, 26 },   /* 2342 MHz, corner 26 */
++	{ 2323200000U, 0x04040079U, 0x0a610061U, 0x3U, 27 },   /* 2323 MHz, corner 27 */
++	{ 2419200000U, 0x0401007eU, 0x0a650065U, 0x3U, 27 },   /* 2419 MHz, corner 27 */
++	{ 2342400000U, 0x0404007aU, 0x0a620062U, 0x3U, 28 },   /* 2342 MHz, corner 28 */
++	{ 2438400000U, 0x0401007fU, 0x0a660066U, 0x3U, 28 },   /* 2438 MHz, corner 28 */
++	{ 2361600000U, 0x0404007bU, 0x0a620062U, 0x3U, 29 },   /* 2361 MHz, corner 29 */
++	{ 2457600000U, 0x04010080U, 0x0a660066U, 0x3U, 29 },   /* 2457 MHz, corner 29 */
++};
++static const uint16_t sweet_perf_mv_3[31] = {
++	 828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,  828,
++	 900,  900,  900,  900,  900,  900,  900,  900,  952,  952,  952, 1136,
++	1136, 1136, 1136, 1136, 1136, 1136, 1136,
++};
++
++
++static const struct sweet_osm_lut sweet_perf_lut[PERF_SPEED_BINS] = {
++	{ sweet_perf_lut_0, sizeof(sweet_perf_lut_0) / sizeof(sweet_perf_lut_0[0]),
++	  sweet_perf_mv_0, sizeof(sweet_perf_mv_0) / sizeof(sweet_perf_mv_0[0]) },
++	{ sweet_perf_lut_1, sizeof(sweet_perf_lut_1) / sizeof(sweet_perf_lut_1[0]),
++	  sweet_perf_mv_1, sizeof(sweet_perf_mv_1) / sizeof(sweet_perf_mv_1[0]) },
++	{ sweet_perf_lut_2, sizeof(sweet_perf_lut_2) / sizeof(sweet_perf_lut_2[0]),
++	  sweet_perf_mv_2, sizeof(sweet_perf_mv_2) / sizeof(sweet_perf_mv_2[0]) },
++	{ sweet_perf_lut_3, sizeof(sweet_perf_lut_3) / sizeof(sweet_perf_lut_3[0]),
++	  sweet_perf_mv_3, sizeof(sweet_perf_mv_3) / sizeof(sweet_perf_mv_3[0]) },
++};
++
++static inline uint32_t
++sclk_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++sclk_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++}
++
++/*
++ * One LUT row as the hardware wants it.  The voltage field is the corner the
++ * OSM hands to CPRh plus the millivolt figure CPRh uses before its loop
++ * settles; both come from the same table the OSM will run, so frequency and
++ * voltage can never be programmed from different speed bins.  The ceiling is
++ * used rather than a computed target: it is the highest voltage fused for that
++ * corner, so the open-loop step cannot under-volt.
++ */
++static void
++sclk_row(const struct sweet_osm_lut *lut, unsigned i, uint32_t *index,
++    uint32_t *freq, uint32_t *volt, uint32_t *override, uint32_t *spare)
++{
++	/*
++	 * Slots past the table's end repeat the last level, the way
++	 * clk_osm_setup_hw_table() does; INDEX_REG always carries the slot
++	 * number, because that is the key the OSM looks the row up by.
++	 */
++	unsigned src = i < lut->n ? i : lut->n - 1;
++
++	*index = i;
++	unsigned corner = lut->rows[src].corner;
++	if (corner >= lut->corners) {
++		corner = lut->corners - 1;
++	}
++	*freq = lut->rows[src].freq_data;
++	*volt = ((uint32_t)corner << OSM_MV_SHIFT) | (lut->mv[corner] & OSM_MV_MASK);
++	*override = lut->rows[src].override_data;
++	*spare = lut->rows[src].spare_data;
++}
++
++/* Returns the number of rows that did not read back as written. */
++static unsigned
++sclk_program(vm_offset_t osm, const struct sweet_osm_lut *lut, unsigned first)
++{
++	unsigned bad = 0;
++
++	for (unsigned i = first; i < OSM_TABLE_SIZE; i++) {
++		uint32_t index, freq, volt, override, spare;
++		sclk_row(lut, i, &index, &freq, &volt, &override, &spare);
++		sclk_wr(osm, OSM_INDEX(i), index);
++		sclk_wr(osm, OSM_FREQ(i), freq);
++		sclk_wr(osm, OSM_VOLT(i), volt);
++		sclk_wr(osm, OSM_OVERRIDE(i), override);
++		sclk_wr(osm, OSM_SPARE(i), spare);
++	}
++	__builtin_arm_dsb(DSB_SY);
++
++	for (unsigned i = first; i < OSM_TABLE_SIZE; i++) {
++		uint32_t index, freq, volt, override, spare;
++		sclk_row(lut, i, &index, &freq, &volt, &override, &spare);
++		if (sclk_rd(osm, OSM_INDEX(i)) != index ||
++		    sclk_rd(osm, OSM_FREQ(i)) != freq ||
++		    sclk_rd(osm, OSM_VOLT(i)) != volt ||
++		    sclk_rd(osm, OSM_OVERRIDE(i)) != override ||
++		    sclk_rd(osm, OSM_SPARE(i)) != spare) {
++			bad++;
++		}
++	}
++	return bad;
++}
++
++/*
++ * Report the current state, then request the fastest level at or below
++ * sweetcpufreq.  Returns the measured clock afterwards, or 0 if nothing was
++ * requested.
++ */
++extern "C" uint32_t
++sweet_cpuclock_up(void)
++{
++	uint32_t target_mhz = 1728;
++	PE_parse_boot_argn("sweetcpufreq", &target_mhz, sizeof(target_mhz));
++
++	vm_offset_t osm = ml_io_map(OSM_PERF_PA, 0x2000);
++	vm_offset_t cprh = ml_io_map(CPRH_PERF_PA, 0x4000);
++	vm_offset_t fuse = ml_io_map(QFPROM_PA, 0x400);   /* covers 0x130..0x137 */
++	if (!osm || !cprh || !fuse) {
++		IOLog("SWEET CPUCLK: map failed (osm %#lx cprh %#lx fuse %#lx)\n",
++		    (unsigned long)osm, (unsigned long)cprh, (unsigned long)fuse);
++		sweet_status_set(8, "O map");
++		return 0;
++	}
++
++	uint32_t bin = (sclk_rd(fuse, (uint32_t)PERFCL_EFUSE) >> PERFCL_EFUSE_SHIFT) &
++	    PERFCL_EFUSE_MASK;
++	/* An unreadable fuse reads as all ones; do not trust a table then. */
++	bool bin_ok = bin < PERF_SPEED_BINS;
++	if (!bin_ok) {
++		IOLog("SWEET CPUCLK: perf speed bin fuse reads %u (invalid); using bin 0 tables\n", bin);
++		bin = 0;
++	}
++	const struct sweet_osm_lut *lut = &sweet_perf_lut[bin];
++
++	uint32_t enable = sclk_rd(osm, OSM_ENABLE);
++	uint32_t pstate = sclk_rd(osm, OSM_PSTATE_STATUS);
++	uint32_t desired = sclk_rd(osm, OSM_PSTATE_DESIRED);
++	bool osm_on = (enable & 1) != 0;
++	IOLog("SWEET CPUCLK: perf speed bin %u, %u levels / %u corners; OSM enable=%#x "
++	    "pstate=%#x desired=%#x\n", bin, lut->n, lut->corners, enable, pstate, desired);
++
++	uint32_t lut0_index = sclk_rd(osm, OSM_INDEX(0));
++	uint32_t lut0_volt = sclk_rd(osm, OSM_VOLT(0));
++	uint32_t lut_last_freq = sclk_rd(osm, OSM_FREQ(lut->n - 1));
++	IOLog("SWEET CPUCLK: LUT[0] index=%u volt=%#x, LUT[%u] freq=%#x (%s)\n",
++	    lut0_index, lut0_volt, lut->n - 1, lut_last_freq,
++	    lut_last_freq ? "programmed" : "empty");
++
++	uint32_t cpr_ctl = sclk_rd(cprh, CPR_CTL);
++	uint32_t cprh_ctl = sclk_rd(cprh, CPRH_CTL);
++	uint32_t cprh_status = sclk_rd(cprh, CPRH_STATUS);
++	bool cprh_on = (cpr_ctl & 1) && (cprh_ctl & 1);
++	IOLog("SWEET CPUCLK: CPRh cpr_ctl=%#x cprh_ctl=%#x status=%#x (corner %u) -> %s\n",
++	    cpr_ctl, cprh_ctl, cprh_status, cprh_status & 0x3f,
++	    cprh_on ? "serving" : "NOT serving");
++
++	char text[8];
++	snprintf(text, sizeof(text), "O%u C%u", (unsigned)osm_on, (unsigned)cprh_on);
++	sweet_status_set(8, text);
++
++	if (target_mhz == 0) {
++		IOLog("SWEET CPUCLK: sweetcpufreq=0, read-only\n");
++		return 0;
++	}
++
++	/*
++	 * The LUT is only safe to (re)write when nothing is running from it, or
++	 * for rows above the level the hardware is executing right now - never
++	 * under the running state machine's feet.
++	 */
++	unsigned first = osm_on ? (pstate & 0x3f) + 1 : 0;
++	unsigned bad = sclk_program(osm, lut, first);
++	if (bad) {
++		IOLog("SWEET CPUCLK: %u LUT rows did not read back; not enabling the OSM\n", bad);
++		sweet_status_set(8, "O lut");
++		return 0;
++	}
++	IOLog("SWEET CPUCLK: LUT rows %u..%u programmed and read back\n", first, OSM_TABLE_SIZE - 1);
++
++	if (!osm_on) {
++		/* Linux clk_osm_enable(): bit 0, then let the hardware settle. */
++		sclk_wr(osm, OSM_ENABLE, enable | 1);
++		__builtin_arm_dsb(DSB_SY);
++		IOSleep(1);
++		uint32_t now = sclk_rd(osm, OSM_ENABLE);
++		IOLog("SWEET CPUCLK: OSM enable %#x -> %#x\n", enable, now);
++		if (!(now & 1)) {
++			IOLog("SWEET CPUCLK: OSM refused to enable; clock stays at the safe source\n");
++			sweet_status_set(8, "O no");
++			return 0;
++		}
++	}
++
++	/*
++	 * No corner will follow the frequency unless CPRh is driving the rail.
++	 * Leave the cluster where it is and let the log say why.
++	 */
++	if (!cprh_on) {
++		IOLog("SWEET CPUCLK: CPRh is not serving VDD_APC1; not raising the request\n");
++		sweet_status_set(8, "O C0");
++		return 0;
++	}
++
++	unsigned best = 0;
++	uint32_t best_hz = 0;
++	for (unsigned i = 0; i < lut->n; i++) {
++		if (lut->rows[i].hz <= (uint64_t)target_mhz * 1000000ULL &&
++		    lut->rows[i].hz >= best_hz) {
++			best = i;
++			best_hz = lut->rows[i].hz;
++		}
++	}
++	if (best == 0) {
++		IOLog("SWEET CPUCLK: no level at or below %u MHz\n", target_mhz);
++		return 0;
++	}
++	if (best == desired && osm_on) {
++		IOLog("SWEET CPUCLK: already requesting level %u (%u MHz)\n", best, best_hz / 1000000);
++		return 0;
++	}
++
++	IOLog("SWEET CPUCLK: requesting level %u (%u MHz, corner %u, %u mV)\n",
++	    best, best_hz / 1000000, lut->rows[best].corner, lut->mv[lut->rows[best].corner]);
++	sclk_wr(osm, OSM_PSTATE_DESIRED, best);
++	__builtin_arm_dsb(DSB_SY);
++	IOSleep(5);
++
++	uint32_t reached = sclk_rd(osm, OSM_PSTATE_STATUS);
++	uint32_t corner_now = sclk_rd(cprh, CPRH_STATUS) & 0x3f;
++	uint32_t mhz = sweet_cpu_clock_mhz();
++	IOLog("SWEET CPUCLK: pstate=%#x (asked %u) CPRh corner %u -> %u MHz\n",
++	    reached, best, corner_now, mhz);
++	if (mhz == 0) {
++		IOLog("SWEET CPUCLK: clock did not measure; leaving as is\n");
++		return 0;
++	}
++
++	/*
++	 * If the measured clock is still the safe source, say so plainly: either
++	 * the OSM did not take the level, or LMH/droop pulled it back. Do not
++	 * touch that protection from here.
++	 */
++	if (mhz < best_hz / 2000000) {
++		IOLog("SWEET CPUCLK: still below the request (WDOG pc %#x); not hacking around it\n",
++		    sclk_rd(osm, 0x1C74));
++	}
++
++	snprintf(text, sizeof(text), "O%u L%u", 1u, best);
++	sweet_status_set(8, text);
++	return mhz;
++}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..ea2ff05 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,6 +10,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetCPUClock.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
